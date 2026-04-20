@@ -73,7 +73,7 @@ HIGH      medium  xss                    innerHTML assignment             .inner
 HIGH      high    prototype_pollution    __proto__ bracket write         .__proto__[
 MEDIUM    high    graphql                GraphQL introspection field     __schema
 ```
-
+![CLI](assets/peelr-cli.png)
 ---
 
 ## Installation
