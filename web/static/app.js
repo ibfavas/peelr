@@ -47,7 +47,6 @@ const LEGEND_ITEMS = [
   { color: "var(--red)", text: "Severity = impact if exploited" },
   { color: "var(--green)", text: "Confidence HIGH = low false positive" },
   { color: "var(--yellow)", text: "Confidence LOW = verify manually" },
-  { color: "", text: "⚡ Flow = confirmed data path from user input → sink" },
 ];
 
 const results = [];
@@ -157,7 +156,7 @@ function renderShell() {
             <div class="empty-title">Ready to scan</div>
             <div class="empty-body">
               Paste any <code>.js</code> URL above and press <strong>Enter</strong> or click <strong>Analyze →</strong>.<br><br>
-              Peelr will check for API keys, hardcoded passwords, XSS sinks, prototype pollution gadgets, GraphQL endpoints, and trace whether user-controlled data flows into dangerous functions.<br><br>
+              Peelr will check for API keys, hardcoded passwords, XSS sinks, prototype pollution gadgets, GraphQL endpoints, and more.<br><br>
               Each finding shows its <strong>severity</strong> (how bad if real) and <strong>confidence</strong> (how likely it's a real issue, not a false positive).
             </div>
           </div>
@@ -278,9 +277,8 @@ async function runSingle() {
       renderDiff(data.diff, url);
     } else {
       addResult(data);
-      const flows = (data.flows || []).length;
       const findings = (data.findings || []).length;
-      toast(`Scan complete: ${findings} finding${findings !== 1 ? "s" : ""}${flows ? ` · ⚡ ${flows} taint flow${flows !== 1 ? "s" : ""}` : ""}`, "ok");
+      toast(`Scan complete: ${findings} finding${findings !== 1 ? "s" : ""}`, "ok");
     }
   } catch (error) {
     toast(`Network error: ${error.message}`, "err");
@@ -360,7 +358,6 @@ function buildFileCard(result, filtered, idx) {
   const card = document.createElement("div");
   card.className = "file-card";
 
-  const flows = result.flows || [];
   const isErr = !!result.error;
   const riskLabel = result.risk_label || "minimal";
   const riskScore = result.risk_score || 0;
@@ -370,10 +367,9 @@ function buildFileCard(result, filtered, idx) {
       <div class="file-status ${isErr ? "st-err" : "st-ok"}" title="${isErr ? "Fetch failed" : "Fetched successfully"}"></div>
       <div class="file-url">${x(result.url)}</div>
       <div class="file-badges">
-        <span class="risk-badge risk-${riskLabel}" title="Risk score ${riskScore}/100 — based on severity, confidence, and taint flows">
+        <span class="risk-badge risk-${riskLabel}" title="Risk score ${riskScore}/100">
           Risk: ${riskLabel.toUpperCase()} (${riskScore})
         </span>
-        ${flows.length ? `<span class="meta-badge mb-flows" title="Confirmed taint paths: user input → dangerous sink">⚡ ${flows.length} taint flow${flows.length !== 1 ? "s" : ""}</span>` : ""}
         <span class="meta-badge mb-findings">${filtered.length} finding${filtered.length !== 1 ? "s" : ""}</span>
         <span class="meta-badge mb-lines">${result.line_count || 0} lines</span>
       </div>
@@ -387,8 +383,6 @@ function buildFileCard(result, filtered, idx) {
   if (isErr) {
     body.innerHTML = `<div style="padding:14px 16px;font-size:12px;color:var(--red);font-family:'JetBrains Mono',monospace">⚠ Fetch failed: ${x(result.error)}</div>`;
   } else {
-    if (flows.length) body.appendChild(buildFlowSection(flows));
-
     const byCat = {};
     filtered.forEach((finding) => {
       (byCat[finding.category] = byCat[finding.category] || []).push(finding);
@@ -398,7 +392,7 @@ function buildFileCard(result, filtered, idx) {
       body.appendChild(buildCategoryGroup(cat, items, idx));
     });
 
-    if (!filtered.length && !flows.length) {
+    if (!filtered.length) {
       body.innerHTML = `<div style="padding:14px 16px;font-size:12px;color:var(--text-dim)">No findings match the current filters.</div>`;
     }
   }
@@ -406,39 +400,6 @@ function buildFileCard(result, filtered, idx) {
   card.appendChild(body);
   card.querySelector(".file-header").addEventListener("click", () => card.classList.toggle("closed"));
   return card;
-}
-
-function buildFlowSection(flows) {
-  const section = document.createElement("div");
-  section.className = "flow-section";
-  section.innerHTML = `
-    <div class="flow-section-header">
-      <span style="font-size:14px">⚡</span>
-      <span class="flow-section-title">Confirmed Taint Flows — User Input Reaching Dangerous Functions</span>
-      <span class="flow-section-desc">These are source → sink paths worth investigating first</span>
-      <span class="flow-count-badge">${flows.length}</span>
-      <span class="flow-chevron">▾</span>
-    </div>
-    <div class="flow-body">
-      ${flows.map((flow) => `
-        <div class="flow-item">
-          <div class="flow-chain">
-            <span class="flow-source" title="User-controlled input source">${x(flow.source)}</span>
-            <span class="flow-arrow-icon">→</span>
-            <span class="flow-sink-name" title="Dangerous sink that receives the tainted value">${x(flow.sink)}</span>
-            <span class="flow-via">via variable <em>${x(flow.variable)}</em></span>
-            <span class="flow-lines-tag">source L${flow.source_line} → sink L${flow.sink_line}</span>
-          </div>
-          ${flow.note ? `<div class="flow-note-text">${x(flow.note)}</div>` : ""}
-        </div>
-      `).join("")}
-    </div>
-  `;
-
-  section.querySelector(".flow-section-header").addEventListener("click", () => {
-    section.classList.toggle("closed");
-  });
-  return section;
 }
 
 function buildCategoryGroup(cat, items, idx) {

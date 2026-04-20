@@ -546,80 +546,12 @@ body {
 }
 
 .mb-findings { background: var(--accent-bg); color: var(--accent); }
-.mb-flows { background: var(--red-bg); color: var(--red); }
 .mb-lines { background: var(--bg-hover); color: var(--text-dim); }
 .collapse-chevron { font-size: 11px; color: var(--text-dim); transition: transform 0.2s; flex-shrink: 0; }
 .file-card.closed .collapse-chevron { transform: rotate(-90deg); }
 .file-card.closed .file-body { display: none; }
 
-/* Flow and finding sections */
-.flow-section {
-  border-top: 2px solid var(--red);
-  background: rgba(248, 81, 73, 0.04);
-}
-
-.flow-section-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 16px;
-  cursor: pointer;
-  user-select: none;
-}
-
-.flow-section-header:hover { background: rgba(248, 81, 73, 0.06); }
-.flow-section-title { font-size: 12px; font-weight: 700; color: var(--red); flex: 1; }
-.flow-section-desc { font-size: 11px; color: var(--text-dim); font-style: italic; }
-
-.flow-count-badge {
-  font-size: 10px;
-  font-family: "JetBrains Mono", monospace;
-  background: var(--red-bg);
-  color: var(--red);
-  padding: 1px 7px;
-  border-radius: 10px;
-}
-
-.flow-section.closed .flow-body { display: none; }
-.flow-section.closed .flow-chevron { transform: rotate(-90deg); }
-.flow-chevron { font-size: 10px; color: var(--red); transition: transform 0.15s; }
-
-.flow-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 16px;
-  border-top: 1px solid rgba(248, 81, 73, 0.12);
-}
-
-.flow-chain { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-
-.flow-source,
-.flow-sink-name {
-  font-family: "JetBrains Mono", monospace;
-  font-size: 12px;
-  font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 4px;
-}
-
-.flow-source { color: var(--cyan); background: rgba(57, 197, 207, 0.08); }
-.flow-arrow-icon { color: var(--text-dim); font-size: 16px; line-height: 1; }
-.flow-sink-name { color: var(--red); background: var(--red-bg); }
-.flow-via { font-size: 11px; color: var(--text-muted); }
-.flow-via em { font-family: "JetBrains Mono", monospace; font-style: normal; color: var(--text); font-weight: 500; }
-
-.flow-lines-tag {
-  font-size: 10px;
-  font-family: "JetBrains Mono", monospace;
-  color: var(--text-dim);
-  background: var(--bg-hover);
-  padding: 1px 6px;
-  border-radius: 3px;
-}
-
-.flow-note-text { font-size: 11px; color: var(--text-muted); line-height: 1.5; padding-left: 2px; }
-.flow-note-text::before { content: "ℹ "; opacity: 0.6; }
+/* Finding sections */
 .cat-group { border-top: 1px solid var(--border); }
 
 .cat-header {

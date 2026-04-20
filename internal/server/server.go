@@ -33,7 +33,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 // fullResult combines scanner output with flow data for the UI.
 type fullResult struct {
 	analyzer.AnalysisResult
-	Flows []ast.FlowFinding `json:"flows"`
+	Flows []ast.FlowFinding `json:"flows,omitempty"`
 }
 
 func runFull(url string) fullResult {

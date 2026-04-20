@@ -31,7 +31,7 @@ Peel back every secret. v` + version + `
 // fullResult matches the combined scan payload used by the server.
 type fullResult struct {
 	analyzer.AnalysisResult
-	Flows []ast.FlowFinding `json:"flows"`
+	Flows []ast.FlowFinding `json:"flows,omitempty"`
 }
 
 func runFull(url, content string) fullResult {
@@ -66,7 +66,6 @@ func main() {
 	silent := flag.Bool("silent", false, "No banner or progress output")
 	workers := flag.Int("workers", 5, "Concurrent workers for batch/file mode")
 	noColor := flag.Bool("no-color", false, "Disable ANSI color output")
-	noFlows := flag.Bool("no-flows", false, "Skip source→sink flow analysis")
 	showVer := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -142,9 +141,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "  scanning %s\n", url)
 			}
 			fr, content := fetchAndRun(url)
-			if *noFlows {
-				fr.Flows = nil
-			}
+			fr.Flows = nil
 			_ = content
 			// Keep successful CLI scans in history so diff mode works the same as the UI.
 			if !*diffMode && fr.Error == "" {
@@ -309,7 +306,7 @@ func printTable(results []fullResult, color bool) {
 			fmt.Fprintf(os.Stderr, "ERROR  %s: %s\n", r.URL, r.Error)
 			continue
 		}
-		if len(r.Findings) == 0 && len(r.Flows) == 0 {
+		if len(r.Findings) == 0 {
 			if color {
 				fmt.Fprintf(w, "%s# %s — no findings%s\n", cGray, r.URL, cReset)
 			} else {
@@ -331,24 +328,10 @@ func printTable(results []fullResult, color bool) {
 		}
 
 		fmt.Fprintf(w, "\n%s%s%s\n", cBold, r.URL, rst(color))
-		fmt.Fprintf(w, "%s%d lines · %d findings · %d flows · risk %s%s%s [%d/100]%s\n",
-			cGray, r.LineCount, len(r.Findings), len(r.Flows),
+		fmt.Fprintf(w, "%s%d lines · %d findings · risk %s%s%s [%d/100]%s\n",
+			cGray, r.LineCount, len(r.Findings),
 			riskCol, r.RiskLabel, cGray, r.RiskScore, rst(color))
 		fmt.Fprintln(w, strings.Repeat("─", 90))
-
-		if len(r.Flows) > 0 {
-			fmt.Fprintf(w, "%s⚡ SOURCE → SINK FLOWS%s\n", cRed+cBold, rst(color))
-			for _, fl := range r.Flows {
-				fmt.Fprintf(w, "  %s%s%s → %s%s%s  via var '%s'  (L%d→L%d)\n",
-					cCyan, fl.Source, rst(color),
-					cRed, fl.Sink, rst(color),
-					fl.Variable, fl.SourceLine, fl.SinkLine)
-				if fl.Note != "" {
-					fmt.Fprintf(w, "    %s# %s%s\n", cGray, fl.Note, rst(color))
-				}
-			}
-			fmt.Fprintln(w, strings.Repeat("─", 90))
-		}
 
 		fmt.Fprintf(w, "%sSEV\tCONF\tCATEGORY\tTYPE\tVALUE%s\n", cBold, rst(color))
 		fmt.Fprintln(w, strings.Repeat("─", 90))
@@ -371,10 +354,8 @@ func printTable(results []fullResult, color bool) {
 	w.Flush()
 
 	total, crit, high, med, low := 0, 0, 0, 0, 0
-	totalFlows := 0
 	hc, mc, lc := 0, 0, 0
 	for _, r := range results {
-		totalFlows += len(r.Flows)
 		for _, f := range r.Findings {
 			total++
 			switch f.Severity {
@@ -404,7 +385,6 @@ func printTable(results []fullResult, color bool) {
 		cRed+cBold, crit, rst(color),
 		cOrange, high, rst(color),
 		cYellow, med, rst(color), low)
-	fmt.Printf("  Flows:    %s%d confirmed source→sink paths%s\n", cRed+cBold, totalFlows, rst(color))
 	fmt.Printf("  Confidence: %s%d high%s  %s%d medium%s  %s%d low%s\n",
 		cGreen, hc, rst(color), cYellow, mc, rst(color), cGray, lc, rst(color))
 }
@@ -418,10 +398,6 @@ func printPlain(results []fullResult) {
 		for _, f := range r.Findings {
 			fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\tL%d\n",
 				r.URL, f.Severity, f.Confidence, f.Category, f.Type, f.Value, f.Line)
-		}
-		for _, fl := range r.Flows {
-			fmt.Printf("%s\tFLOW\thigh\tflow\t%s→%s\t%s\tL%d→L%d\n",
-				r.URL, fl.Source, fl.Sink, fl.Variable, fl.SourceLine, fl.SinkLine)
 		}
 	}
 }
