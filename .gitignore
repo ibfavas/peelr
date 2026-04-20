@@ -1,0 +1,10 @@
+# compiled binary
+/peelr
+/peelr.exe
+
+# scan history (personal data)
+.peelr/
+
+# OS noise
+.DS_Store
+Thumbs.db
