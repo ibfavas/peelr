@@ -46,8 +46,6 @@ func runFull(url string) fullResult {
 		result2.Timestamp = result.Timestamp
 		result = result2
 	}
-	// History should not block the response path.
-	_ = history.Save(result)
 	return fullResult{AnalysisResult: result, Flows: flows}
 }
 
@@ -75,11 +73,13 @@ func analyzeHandler(w http.ResponseWriter, r *http.Request) {
 	fr := runFull(url)
 	resp := analyzeResponse{fullResult: fr}
 
-	if req.Diff {
+	if req.Diff && fr.Error == "" {
 		dr, err := history.Diff(fr.AnalysisResult)
 		if err == nil {
 			resp.Diff = &dr
 		}
+	} else if fr.Error == "" {
+		_ = history.Save(fr.AnalysisResult)
 	}
 	jsonOK(w, resp)
 }
@@ -125,11 +125,13 @@ func batchHandler(w http.ResponseWriter, r *http.Request) {
 			defer func() { <-sem }()
 			fr := runFull(strings.TrimSpace(url))
 			resp := analyzeResponse{fullResult: fr}
-			if req.Diff {
+			if req.Diff && fr.Error == "" {
 				dr, err := history.Diff(fr.AnalysisResult)
 				if err == nil {
 					resp.Diff = &dr
 				}
+			} else if fr.Error == "" {
+				_ = history.Save(fr.AnalysisResult)
 			}
 			results[idx] = resp
 		}(i, u)

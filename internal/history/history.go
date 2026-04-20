@@ -90,21 +90,19 @@ func Diff(result analyzer.AnalysisResult) (DiffResult, error) {
 		URL:         result.URL,
 		CurrentScan: now,
 	}
+	if result.Error != "" {
+		return dr, fmt.Errorf("cannot diff failed scan: %s", result.Error)
+	}
 
 	prev, err := Load(result.URL)
 	if err != nil {
 		return dr, err
 	}
 
-	// Always refresh the stored baseline.
-	if saveErr := Save(result); saveErr != nil {
-		_ = saveErr
-	}
-
 	if prev == nil {
 		dr.IsFirstScan = true
 		dr.New = result.Findings
-		return dr, nil
+		return dr, Save(result)
 	}
 
 	dr.PreviousScan = prev.ScannedAt
@@ -131,7 +129,7 @@ func Diff(result analyzer.AnalysisResult) (DiffResult, error) {
 		}
 	}
 
-	return dr, nil
+	return dr, Save(result)
 }
 
 func ListHistory() ([]Record, error) {

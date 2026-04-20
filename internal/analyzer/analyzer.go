@@ -11,6 +11,8 @@ import (
 	"unicode"
 )
 
+const maxJSBytes = 15 << 20
+
 type Severity string
 
 const (
@@ -336,8 +338,17 @@ func fetchContent(url string) (string, error) {
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	lr := io.LimitReader(resp.Body, 15<<20)
+	if resp.ContentLength > maxJSBytes {
+		return "", fmt.Errorf("file exceeds %d MB limit", maxJSBytes>>20)
+	}
+	lr := io.LimitReader(resp.Body, maxJSBytes+1)
 	b, err := io.ReadAll(lr)
+	if err != nil {
+		return "", err
+	}
+	if len(b) > maxJSBytes {
+		return "", fmt.Errorf("file exceeds %d MB limit", maxJSBytes>>20)
+	}
 	return string(b), err
 }
 
@@ -354,7 +365,7 @@ func AnalyzeContent(source, content string, flowCount int) AnalysisResult {
 
 	dd := newDedup()
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	scanner.Buffer(make([]byte, 1024*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 1024*1024), maxJSBytes+1)
 	lineNum := 0
 
 	for scanner.Scan() {
@@ -400,6 +411,10 @@ func AnalyzeContent(source, content string, flowCount int) AnalysisResult {
 				result.ConfSummary[string(conf)]++
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		result.Error = fmt.Sprintf("scan failed: %v", err)
+		return result
 	}
 	result.LineCount = lineNum
 	result.RiskScore, result.RiskLabel = computeRisk(result.Findings, flowCount)

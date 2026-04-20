@@ -53,6 +53,7 @@ func fetchAndRun(url string) (fullResult, string) {
 
 func main() {
 	port := flag.Int("port", 8080, "Web UI port (server mode)")
+	listen := flag.String("listen", "127.0.0.1", "Web UI listen address (server mode)")
 	urlFlag := flag.String("url", "", "Single JS URL to analyze")
 	fileFlag := flag.String("file", "", "File with one URL per line")
 	outFmt := flag.String("format", "table", "Output: table | json | plain")
@@ -106,7 +107,7 @@ func main() {
 		if !*silent {
 			fmt.Print(banner)
 		}
-		if err := server.Start(fmt.Sprintf(":%d", *port)); err != nil {
+		if err := server.Start(fmt.Sprintf("%s:%d", *listen, *port)); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -145,8 +146,10 @@ func main() {
 				fr.Flows = nil
 			}
 			_ = content
-			// Keep CLI scans in history so diff mode works the same as the UI.
-			_ = history.Save(fr.AnalysisResult)
+			// Keep successful CLI scans in history so diff mode works the same as the UI.
+			if !*diffMode && fr.Error == "" {
+				_ = history.Save(fr.AnalysisResult)
+			}
 			results[idx] = fr
 		}(i, u)
 	}
@@ -425,6 +428,10 @@ func printPlain(results []fullResult) {
 
 func printDiff(results []fullResult, outFmt string, color bool) {
 	for _, r := range results {
+		if r.Error != "" {
+			fmt.Fprintf(os.Stderr, "ERROR  %s: %s\n", r.URL, r.Error)
+			continue
+		}
 		dr, err := history.Diff(r.AnalysisResult)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "diff error for %s: %v\n", r.URL, err)
