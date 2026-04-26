@@ -2,7 +2,7 @@
 
 **Peel back every secret.**
 
-Peelr is a fast JavaScript security scanner for bug bounty hunters and security researchers. Point it at a `.js` file and it highlights the lines worth opening first: exposed secrets, dangerous sinks, prototype pollution gadgets, GraphQL clues, and source-to-sink taint flows.
+Peelr is a fast JavaScript recon triage engine for bug bounty hunters and security researchers. Point it at a `.js` file and it highlights the lines worth opening first: exposed secrets, dangerous sinks, prototype pollution gadgets, GraphQL clues, and source-to-sink taint flows.
 
 [![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen?style=flat)](#installation)
