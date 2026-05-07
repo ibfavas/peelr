@@ -1,352 +1,492 @@
-# 🧅 Peelr
+# Peelr
 
-**Peel back every secret.**
+**Peelr is a JavaScript URL analysis and triage tool for security research.**
 
-Peelr is a fast JavaScript recon triage engine for bug bounty hunters and security researchers. Point it at a `.js` file and it highlights the lines worth opening first: exposed secrets, dangerous sinks, prototype pollution gadgets, GraphQL clues, and source-to-sink taint flows.
+You give Peelr direct JavaScript URLs or local JavaScript files. It fetches or reads the source, analyzes the code, and highlights the findings worth reviewing first.
+
+Current release: `2.0.0`
 
 [![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen?style=flat)](#installation)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat)](#installation)
 
-> JavaScript recon, but with triage.  
-> Peelr helps you move from "there are 84 JS files here" to "these 3 deserve manual review right now."
-
----
-
 ## Why Peelr
 
-Modern targets ship huge bundles, vendor blobs, and frontend code paths nobody wants to read line by line. Peelr cuts that down by combining regex-based detection with lightweight token-level flow correlation, confidence scoring, and per-file risk scoring.
+When you already have JavaScript URLs, the hard part is usually not collection. The hard part is triage.
 
-It is designed for:
+Large frontend bundles often contain:
 
-- Bug bounty recon
-- Web app security reviews
-- Triage during content discovery
-- Repeat scans against changing targets
-- Fast CLI pipelines with minimal setup
+- exposed secrets and tokens
+- dangerous DOM sinks
+- internal API routes
+- sensitive parameters
+- filesystem paths
+- comments that reveal implementation details
 
-It is not trying to be a full static analysis framework. It is trying to be fast, useful, and easy to drop into real recon.
+Peelr is built for that workflow. It is intentionally focused:
 
----
+- no domain discovery
+- no crawler logic
+- no archive expansion
+- no browser automation
 
-## What It Finds
+It is meant for the moment where you already have `.js` URLs and want fast answers about what deserves attention first.
 
-- Hardcoded API keys, tokens, passwords, private keys, and connection strings
-- XSS sinks such as `innerHTML`, `eval`, `document.write`, `Function()`, and `dangerouslySetInnerHTML`
-- Source-to-sink taint flows like `location.hash -> innerHTML`
-- Prototype pollution gadgets like `__proto__`, `constructor.prototype`, and unsafe merge patterns
-- GraphQL endpoints, operations, Apollo usage, and introspection fields
-- Endpoints, API paths, emails, filesystem paths, S3 references, and developer comments
-- A `0-100` risk score for each scanned file
-- Diffs against previous scans so target changes stand out immediately
+## Security Detection
 
----
+### API Keys
 
-## Quick Example
+Peelr detects:
 
-```text
- ____           _
-|  _ \ ___  ___| |_ __
-| |_) / _ \/ _ \ | '__|
-|  __/  __/  __/ | |
-|_|   \___|\___|_|_|
-Peel back every secret. v1.1.0
+- AWS access key patterns
+- Google API keys
+- GitHub tokens
+- Stripe keys
+- PayPal tokens
+- Slack tokens and webhook-like strings
+- Firebase references and client-side keys
+- JWT tokens
+- SendGrid keys
+- generic API key and access token patterns
 
-  scanning https://target.com/app.js
+### Credentials
 
-https://target.com/app.js
-1842 lines · 7 findings · 2 flows · risk HIGH [68/100]
-──────────────────────────────────────────────────────────────────────────────
-⚡ SOURCE → SINK FLOWS
-  location.hash → innerHTML  via var 'userInput'  (L12→L47)
-    # Direct HTML injection. Tainted variable reaches innerHTML.
-──────────────────────────────────────────────────────────────────────────────
-SEV       CONF    CATEGORY               TYPE                            VALUE
-──────────────────────────────────────────────────────────────────────────────
-CRITICAL  high    api_keys               AWS Access Key                  AKIAIOSFODNN7EXAMPLE
-HIGH      high    api_keys               GitHub Token (PAT)             ghp_aBcDeFgHiJkLmN...
-HIGH      medium  xss                    innerHTML assignment           .innerHTML =
-HIGH      high    prototype_pollution    __proto__ bracket write        .__proto__[
-MEDIUM    high    graphql                GraphQL introspection field    __schema
-```
+Peelr looks for:
 
-![CLI](assets/peelr-cli.png)
+- hardcoded passwords
+- hardcoded usernames
+- bearer tokens
+- basic auth headers
+- database connection strings
+- private key blocks
 
----
+### Email Addresses
 
-## What Peelr Is And Isn't
+Peelr extracts email addresses found in JavaScript code and applies stricter validation so strings that are really URL fragments with `@` do not get treated as normal email findings.
 
-| Peelr does | Peelr does not |
-|---|---|
-| Fast pattern matching over real-world JS | Full SSA or inter-procedural dataflow |
-| Lightweight source-to-sink flow correlation | Prove exploitability |
-| Confidence scoring to reduce noise | Replace manual validation |
-| Historical diffing for repeat scans | Act like a browser crawler |
-| Clean CLI and web UI workflows | Require a heavy dependency stack |
+### XSS Vulnerabilities
 
----
+Peelr identifies client-side patterns that commonly lead to Cross-Site Scripting issues, including:
+
+- `innerHTML` assignments
+- `outerHTML` assignments
+- `document.write()` usage
+- `eval()` usage
+- `new Function()`
+- `insertAdjacentHTML`
+- `srcdoc`
+- React `dangerouslySetInnerHTML`
+- jQuery HTML injection points
+
+### XSS Functions
+
+Peelr also flags function patterns and DOM usage that may become XSS sinks depending on how data reaches them. The output is meant to help you prioritize manual review, not claim exploitability automatically.
+
+## API & Endpoint Discovery
+
+Peelr extracts:
+
+- API endpoints referenced in `fetch()`
+- `axios` request paths
+- `XMLHttpRequest` `.open()` targets
+- jQuery AJAX URLs
+- endpoint literals
+- base paths and versioned routes
+- network request hints across the file
+
+## Parameter Analysis
+
+Peelr finds:
+
+- URL query parameters such as `?key=` and `&email=`
+- function parameters
+- sensitive parameters such as `token`, `key`, `secret`, `password`, and related names
+
+## Path & Directory Discovery
+
+Peelr extracts:
+
+- relative paths
+- absolute paths
+- filesystem-like references
+- embedded file and route references
+
+## Code Analysis
+
+Peelr highlights:
+
+- interesting comments like `TODO`, `FIXME`, `SECURITY`, `HACK`, `BUG`, and `WARNING`
+- suspicious comments containing sensitive or security-relevant language
+
+## Advanced Features
+
+- Multiple File Analysis: analyze one or many JavaScript URLs in a single run
+- Local JavaScript Analysis: analyze `.js` files directly without fetching them from the network
+- File Upload: upload a text file with multiple JavaScript URLs in the web UI
+- Live Results: view results as they are processed
+- Code Context: inspect matching code through `Show Code`
+- Filterable Results: filter by category, severity, and search text
+- Modern UI: dark terminal-style interface optimized for large result sets
+- Reduced False Positives: noise controls and stricter matching to reduce junk findings
+
+## Screenshots
+
+![Peelr input view](assets/peelr-web-input.png)
+
+![Peelr results view](assets/peelr-web-console.png)
 
 ## Installation
 
 Requirement: `Go 1.21+`
 
+### Linux
+
+Ubuntu or Debian:
+
 ```bash
-# Arch
-sudo pacman -S go
-
-# Kali / Debian / Ubuntu
 sudo apt install golang-go
+```
 
-# macOS
+Arch Linux:
+
+```bash
+sudo pacman -S go
+```
+
+### macOS
+
+```bash
 brew install go
 ```
 
-Build from source:
+### Build
 
 ```bash
 git clone https://github.com/ibfavas/peelr.git
 cd peelr
-go build -o peelr ./cmd/peelr/
+go build -o peelr ./cmd/peelr
 ```
 
-Peelr uses the Go standard library only. No external runtime dependencies and no extra build tooling.
-
----
+Peelr uses the Go standard library only.
 
 ## Usage
 
-### Web UI
+### Run the Web UI
 
 ```bash
 ./peelr
-./peelr --port 9000
 ```
 
-Then open `http://localhost:8080` or your chosen port.
+Default address:
 
-<div align="center">
-  <img src="assets/peelr-web-01.png" alt="Dashboard" width="45%">
-  <img src="assets/peelr-web-2.png" alt="Scan Results" width="45%">
-</div>
+```text
+http://127.0.0.1:8080
+```
 
-The web UI includes:
+Custom bind address and port:
 
-- Risk score per file
-- Taint flow viewer
-- Diff mode
-- Severity and category filtering
-- JSON export
-- Batch analysis for up to 50 URLs
+```bash
+./peelr --listen 0.0.0.0 --port 9000
+```
 
-### CLI: single URL
+### Analyze a Single JavaScript URL
 
 ```bash
 ./peelr --url https://target.com/app.js
 ```
 
-### CLI: pipe from recon tools
+### Analyze a File Containing JavaScript URLs
 
 ```bash
-gau target.com | grep '\.js$' | ./peelr
-waybackurls target.com | grep '\.js$' | ./peelr
-katana -u target.com -f endpoint | grep '\.js$' | ./peelr
+./peelr --file js_urls.txt
 ```
 
-### CLI: file input
+Expected format:
 
-```bash
-./peelr --file js_urls.txt --workers 10
+```text
+https://example.com/app.js
+https://cdn.example.com/vendor.js
+https://static.example.com/runtime.js
 ```
 
-### Output formats
+### Analyze Local JavaScript Files Directly
 
 ```bash
-# Default table output
-./peelr --url https://target.com/app.js
+./peelr --js-file ./sample-test.js
+./peelr --js-file ./dist
+./peelr --js-file ./a.js,./b.js
+```
 
-# JSON
+### Pipe JavaScript URLs In
+
+```bash
+cat js_urls.txt | ./peelr
+```
+
+## Web UI Guide
+
+The web UI is focused on direct JavaScript URL analysis only.
+
+You can:
+
+- paste one or more JavaScript URLs
+- upload a text file containing JavaScript URLs
+- run an analysis job
+- monitor progress live while files are processed
+- filter results by category
+- filter results by severity
+- search across titles, values, notes, and context
+- opt into lower-signal findings only when needed
+- expand more files and more findings on demand
+
+### Web UI Workflow
+
+1. Start Peelr with `./peelr`.
+2. Open `http://127.0.0.1:8080`.
+3. Paste JavaScript URLs or upload a list file.
+4. Click `Run Analysis`.
+5. Review the stats, runtime progress, and grouped findings.
+6. Use category and severity filters to narrow the result set.
+7. Open `Show Code` on findings that need direct inspection.
+
+## CLI Output Formats
+
+### Table
+
+```bash
+./peelr --url https://target.com/app.js --format table
+```
+
+### JSON
+
+```bash
 ./peelr --url https://target.com/app.js --format json
+```
 
-# Plain tab-separated output
+### Plain
+
+```bash
 ./peelr --url https://target.com/app.js --format plain
 ```
 
-### Filtering
+## Example CLI Output
+
+The repository includes a local sample file at [sample-test.js](sample-test.js).
+
+Run it with:
 
 ```bash
-./peelr --url https://target.com/app.js --only-high-conf
-./peelr --url https://target.com/app.js --min-severity high
-./peelr --url https://target.com/app.js --min-confidence high --min-severity medium
-./peelr --file urls.txt --no-flows
+./peelr --js-file ./sample-test.js
 ```
 
-### Diff and history
+Example output:
+
+```text
+sample-test.js
+23 lines  14 findings  risk MEDIUM [29/100]
+SEVERITY  CONFIDENCE  CATEGORY     TYPE                       LINE  VALUE
+info      low         comments     TODO Comment               1     // TODO: remove before production
+medium    low         comments     Security Comment           2     // SECURITY: test fixture for Peelr CLI validation
+info      low         emails       Email Address              4     security@example.com
+medium    low         api_keys     Generic API Key            5     apiKey = "AIzaSyD3MO-TEST-KEY-1234567890abcd
+high      low         credentials  Hardcoded Password         7     Password = "super-secret-password
+info      medium      parameters   Function Parameter         9     name
+info      medium      parameters   Function Parameter         9     markup
+info      low         emails       Email Address              10    security@example.com
+info      medium      endpoints    Endpoint Literal           10    /api/v1/profile?email=security@example.com&token=demo-token
+medium    high        parameters   Sensitive Query Parameter  10    email
+medium    high        parameters   Sensitive Query Parameter  10    token
+info      low         paths        Unix Path                  10    /api/v1/profile
+high      medium      xss          innerHTML Assignment       18    .innerHTML =
+high      medium      xss          document.write Usage       19    document.write(
+```
+
+This sample demonstrates that Peelr can surface multiple categories in one pass:
+
+- comments
+- email addresses
+- API keys
+- credentials
+- endpoints
+- sensitive parameters
+- paths
+- XSS sinks
+
+## History and Diffing
+
+Peelr stores scan history in:
+
+```text
+~/.peelr/history/
+```
+
+### Show history
 
 ```bash
-# First run creates history
-./peelr --url https://target.com/app.js
-
-# Compare against the previous scan
-./peelr --url https://target.com/app.js --diff
-
-# Show scan history
 ./peelr --history
+```
 
-# Clear stored history
+### Diff against the previous scan
+
+```bash
+./peelr --url https://target.com/app.js --diff
+```
+
+### Clear stored history
+
+```bash
 ./peelr --clear-history
 ```
 
-### Exit codes for automation
+## HTTP API
 
-Peelr exits with code `1` when filtered results contain any `high` or `critical` finding.
+Peelr uses a job-based API for the web UI.
+
+### Create a job
+
+Send JavaScript URLs in the `urls` form field, or upload a text file with one JavaScript URL per line.
+
+Example:
 
 ```bash
-./peelr --url https://deploy.example.com/app.js --only-high-conf
-echo $?
+curl -X POST http://127.0.0.1:8080/api/jobs \
+  -F 'mode=js' \
+  -F 'urls=https://target.com/app.js
+https://target.com/vendor.js'
 ```
 
-### Silent mode
+Response:
+
+```json
+{"job_id":"..."}
+```
+
+### Poll a job
 
 ```bash
-./peelr --url https://target.com/app.js --silent --format plain
+curl http://127.0.0.1:8080/api/jobs/JOB_ID
 ```
 
----
+### Read history
 
-## Detection Coverage
+```bash
+curl http://127.0.0.1:8080/api/history
+```
 
-| Category | Examples |
+## Technical Details
+
+### Architecture
+
+- Backend: Go with the standard library
+- Frontend: vanilla JavaScript, HTML, and CSS
+- Analysis engine: pattern-based JavaScript inspection with noise reduction and result scoring
+
+### Server-Side Processing
+
+All analysis is performed server-side for:
+
+- consistency across browsers
+- lower client-side overhead
+- safer handling of large JavaScript files
+- easier history and diff support
+
+### Current Limits
+
+| Limit | Value |
 |---|---|
-| API keys and tokens | AWS, Google, GitHub, Stripe, Slack, Firebase, JWT, Twilio, SendGrid, Shopify, PayPal, Square, Mapbox |
-| Credentials | Hardcoded passwords, Basic auth headers, bearer tokens, DB connection strings, private key blocks |
-| XSS sinks | `innerHTML`, `outerHTML`, `eval()`, `document.write()`, `Function()`, `dangerouslySetInnerHTML`, jQuery `.html()`, `insertAdjacentHTML` |
-| DOM sinks | `postMessage`, `srcdoc`, `document.domain`, dynamic `script.src`, `window.location` |
-| Prototype pollution | `__proto__`, `constructor.prototype`, unsafe merges, lodash merge patterns |
-| GraphQL | Endpoints, operations, Apollo client usage, `gql` tags, introspection fields |
-| Endpoints and URLs | `fetch()`, `axios`, XHR, jQuery AJAX, API literals, full URLs |
-| Misc | Emails, Unix and Windows paths, S3 bucket references, TODO/FIXME/security comments |
-
-### Tracked taint sources
-
-`location.hash`, `location.search`, `location.href`, `document.URL`, `document.referrer`, `document.cookie`, `URLSearchParams`, `postMessage event.data`, `window.name`, `localStorage.getItem`, `req.body`, `req.params`, `req.query`, `JSON.parse(input)`
-
-### Tracked taint sinks
-
-`innerHTML`, `outerHTML`, `document.write`, `eval`, `Function()`, `insertAdjacentHTML`, `jQuery .html()`, `setTimeout(string)`, `script.src`, `window.location`, `postMessage`
-
----
-
-## Confidence Model
-
-Each finding gets a confidence level:
-
-| Confidence | Meaning |
-|---|---|
-| `high` | Strong structural match with low expected false positives |
-| `medium` | Plausible finding that needs manual confirmation |
-| `low` | Broad heuristic; expect more noise |
-
-Confidence is automatically downgraded when the value looks like a placeholder such as `example`, `dummy`, or `REPLACE`, or when the match appears on a comment line.
-
----
+| Maximum fetched source size | `20 MB` |
+| Maximum JavaScript URLs per web job | `250` |
+| URL fetch timeout | `20s` |
 
 ## Risk Scoring
 
-Each file gets a `0-100` score based on severity, confidence, and confirmed taint flows.
+Each analyzed JavaScript file gets a `0-100` risk score and a label.
 
 | Score | Label |
 |---|---|
 | `80-100` | `critical` |
 | `55-79` | `high` |
-| `30-54` | `medium` |
-| `10-29` | `low` |
+| `28-54` | `medium` |
+| `10-27` | `low` |
 | `0-9` | `minimal` |
 
-CLI output is sorted by risk so the worst files rise to the top first.
+Risk is based on:
 
----
+- finding severity
+- finding confidence
+- finding volume
 
-## HTTP API
+## Confidence Levels
 
-### Analyze one JS file
-
-```bash
-curl -X POST http://localhost:8080/api/analyze \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://target.com/app.js"}' | jq .
-```
-
-### Analyze a batch
-
-```bash
-curl -X POST http://localhost:8080/api/analyze/batch \
-  -H 'Content-Type: application/json' \
-  -d '{"urls":["https://target.com/app.js","https://target.com/vendor.js"]}' | jq .
-```
-
-### Retrieve history
-
-```bash
-curl http://localhost:8080/api/history | jq .
-```
-
-Batch API limits: `1-50` URLs per request.
-
----
-
-## CLI Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--port` | `8080` | Web UI port |
-| `--url` | - | Single URL to analyze |
-| `--file` | - | File with one URL per line |
-| `--format` | `table` | Output: `table`, `json`, `plain` |
-| `--min-severity` | - | `critical`, `high`, `medium`, `low`, `info` |
-| `--min-confidence` | - | `high`, `medium`, `low` |
-| `--only-high-conf` | `false` | Keep only high-confidence findings |
-| `--diff` | `false` | Show only new findings vs. previous scan |
-| `--history` | `false` | List previously scanned URLs |
-| `--clear-history` | `false` | Delete stored scan history |
-| `--workers` | `5` | Concurrent workers in batch mode |
-| `--no-flows` | `false` | Skip taint flow analysis |
-| `--silent` | `false` | Suppress banner and progress output |
-| `--no-color` | `false` | Disable ANSI colors |
-| `--version` | `false` | Print version and exit |
-
----
-
-## Project Layout
-
-```text
-peelr/
-├── cmd/peelr/main.go
-├── internal/analyzer/analyzer.go
-├── internal/ast/ast.go
-├── internal/history/history.go
-├── internal/scorer/scorer.go
-├── internal/server/server.go
-├── web/templates/index.html
-├── web/static/app.css
-└── web/static/app.js
-```
-
----
-
-## Limits
-
-| Limit | Value |
+| Confidence | Meaning |
 |---|---|
-| Maximum JS file size | `15 MB` |
-| Batch size in web/API mode | `50 URLs` |
-| CLI batch size | Unlimited |
-| Default worker count | `5` |
-| HTTP timeout | `20s` per file |
-| History storage | `~/.peelr/history/` |
+| `high` | strong pattern with relatively low false positive rate |
+| `medium` | useful signal that still needs manual validation |
+| `low` | broad heuristic or context with higher noise potential |
 
----
+## Performance Notes
 
-## Disclaimer
+To keep the web UI responsive on noisy scans, Peelr:
 
-Peelr is for authorized security testing and education. Only scan JavaScript from systems you own or have explicit written permission to assess.
+- hides low and info findings by default
+- sorts results by risk and finding density
+- renders a limited number of result files at first
+- renders only the first visible findings per file at first
+- expands more files and more findings on demand
+- trims long code snippets in the default pass
+- debounces text search
+- avoids unnecessary rerender churn when job state has not materially changed
+
+If you are working with very large URL lists, prefer:
+
+- splitting very large batches into smaller runs
+- using JSON output for automation
+- enabling lower-signal findings only after the higher-signal pass
+
+## Use Cases
+
+- Bug Bounty Hunting: find exposed API keys, credentials, and risky sinks quickly
+- Security Audits: identify vulnerable client-side patterns in JavaScript-heavy applications
+- Code Review: automate repetitive reconnaissance and triage
+- Asset Discovery: map API endpoints, routes, and path references
+- Penetration Testing: surface likely attack vectors for manual validation
+
+## What Peelr Is and Isn't
+
+| Peelr does | Peelr does not |
+|---|---|
+| Analyze direct JavaScript URLs | Discover JavaScript from domains |
+| Analyze local JavaScript files | Crawl websites like a browser |
+| Highlight secrets and dangerous client-side patterns | Prove exploitability |
+| Preserve code context for fast review | Replace manual validation |
+| Prioritize high-signal findings | Eliminate all false positives |
+
+## Contributing
+
+Contributions are welcome.
+
+Typical workflow:
+
+1. Fork the repository.
+2. Create a feature branch.
+3. Make the change.
+4. Run `go build ./...`.
+5. Open a pull request.
+
+## Safety and Ethics
+
+Use Peelr only on systems you own or have explicit written permission to test.
+
+This tool is intended for:
+
+- authorized security reviews
+- internal application testing
+- bug bounty recon where program rules allow it
+- education in secure code review and reconnaissance
+
+Unauthorized access to computer systems is illegal.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

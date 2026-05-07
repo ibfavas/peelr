@@ -4,449 +4,362 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"text/tabwriter"
 
 	"github.com/ibfavas/peelr/internal/analyzer"
-	"github.com/ibfavas/peelr/internal/ast"
 	"github.com/ibfavas/peelr/internal/history"
 	"github.com/ibfavas/peelr/internal/server"
 )
 
-const version = "1.1.0"
+const version = "2.0.0"
 
 const banner = `
- ____           _
-|  _ \ ___  ___| |_ __
-| |_) / _ \/ _ \ | '__|
-|  __/  __/  __/ | |
-|_|   \___|\___|_|_|
-Peel back every secret. v` + version + `
+    ____            __
+   / __ \___  ___  / /____
+  / /_/ / _ \/ _ \/ / ___/
+ / ____/  __/  __/ / /
+/_/    \___/\___/_/_/
+peelr ` + version + `  |  js recon and triage
 `
 
-// fullResult matches the combined scan payload used by the server.
-type fullResult struct {
-	analyzer.AnalysisResult
-	Flows []ast.FlowFinding `json:"flows,omitempty"`
-}
-
-func runFull(url, content string) fullResult {
-	flows := ast.Scan(content)
-	result := analyzer.AnalyzeContent(url, content, len(flows))
-	return fullResult{AnalysisResult: result, Flows: flows}
-}
-
-func fetchAndRun(url string) (fullResult, string) {
-	result, content := analyzer.Analyze(url)
-	if result.Error != "" {
-		return fullResult{AnalysisResult: result}, content
-	}
-	flows := ast.Scan(content)
-	result2 := analyzer.AnalyzeContent(url, content, len(flows))
-	result2.Timestamp = result.Timestamp
-	return fullResult{AnalysisResult: result2, Flows: flows}, content
-}
-
 func main() {
-	port := flag.Int("port", 8080, "Web UI port (server mode)")
-	listen := flag.String("listen", "127.0.0.1", "Web UI listen address (server mode)")
-	urlFlag := flag.String("url", "", "Single JS URL to analyze")
-	fileFlag := flag.String("file", "", "File with one URL per line")
-	outFmt := flag.String("format", "table", "Output: table | json | plain")
-	minConf := flag.String("min-confidence", "", "Filter: high | medium | low")
-	minSev := flag.String("min-severity", "", "Filter: critical | high | medium | low | info")
-	onlyHigh := flag.Bool("only-high-conf", false, "Only high-confidence findings")
-	diffMode := flag.Bool("diff", false, "Show only new findings vs last scan")
-	histList := flag.Bool("history", false, "List all previously scanned URLs")
-	clearHist := flag.Bool("clear-history", false, "Delete all scan history")
-	silent := flag.Bool("silent", false, "No banner or progress output")
-	workers := flag.Int("workers", 5, "Concurrent workers for batch/file mode")
-	noColor := flag.Bool("no-color", false, "Disable ANSI color output")
-	showVer := flag.Bool("version", false, "Print version and exit")
+	port := flag.Int("port", 8080, "Web UI port")
+	listen := flag.String("listen", "127.0.0.1", "Web UI listen address")
+	urlFlag := flag.String("url", "", "Single JavaScript URL to analyze")
+	fileFlag := flag.String("file", "", "Text file with one JavaScript URL per line")
+	jsFileFlag := flag.String("js-file", "", "JavaScript file, directory, or comma-separated paths to analyze directly")
+	formatFlag := flag.String("format", "table", "Output format: table | json | plain")
+	diffFlag := flag.Bool("diff", false, "Compare results with the last stored scan")
+	historyFlag := flag.Bool("history", false, "List previous scans")
+	clearHistoryFlag := flag.Bool("clear-history", false, "Delete saved history")
+	workersFlag := flag.Int("workers", 4, "Concurrent workers for URL mode")
+	silentFlag := flag.Bool("silent", false, "Suppress banner and progress")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
-	if *showVer {
+	if *versionFlag {
 		fmt.Println("peelr v" + version)
-		os.Exit(0)
+		return
 	}
-
-	if *clearHist {
-		if err := history.ClearHistory(); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		fmt.Fprintln(os.Stderr, "History cleared.")
-		os.Exit(0)
+	if *clearHistoryFlag {
+		exitIf(history.ClearHistory())
+		return
 	}
-	if *histList {
-		records, err := history.ListHistory()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		if len(records) == 0 {
-			fmt.Fprintln(os.Stderr, "No history yet.")
-			os.Exit(0)
-		}
-		for _, rec := range records {
-			fmt.Printf("%s\t%d findings\t%s\n", rec.ScannedAt, len(rec.Findings), rec.URL)
-		}
-		os.Exit(0)
-	}
-
-	args := flag.Args()
-	stdinPiped := isStdinPiped()
-	cliMode := *urlFlag != "" || *fileFlag != "" || len(args) > 0 || stdinPiped
-
-	if !cliMode {
-		if !*silent {
-			fmt.Print(banner)
-		}
-		if err := server.Start(fmt.Sprintf("%s:%d", *listen, *port)); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+	if *historyFlag {
+		printHistory()
 		return
 	}
 
-	if !*silent {
+	urls := collectURLs(*urlFlag, *fileFlag, flag.Args(), isStdinPiped())
+	localFiles := collectJSFiles(*jsFileFlag)
+	cliMode := len(urls) > 0 || len(localFiles) > 0
+	if !cliMode {
+		if !*silentFlag {
+			fmt.Print(banner)
+		}
+		exitIf(server.Start(fmt.Sprintf("%s:%d", *listen, *port)))
+		return
+	}
+
+	if !*silentFlag {
 		fmt.Fprint(os.Stderr, banner)
 	}
 
-	urls := collectURLs(*urlFlag, *fileFlag, args, stdinPiped)
-	if len(urls) == 0 {
-		fmt.Fprintln(os.Stderr, "error: no URLs provided")
-		os.Exit(1)
+	results := analyzeURLs(urls, *workersFlag, *silentFlag)
+	results = append(results, analyzeFiles(localFiles, *silentFlag)...)
+
+	if *diffFlag {
+		printDiff(results, *formatFlag)
+		return
 	}
-
-	type job struct {
-		idx int
-		url string
-	}
-	results := make([]fullResult, len(urls))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, *workers)
-
-	for i, u := range urls {
-		wg.Add(1)
-		go func(idx int, url string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if !*silent {
-				fmt.Fprintf(os.Stderr, "  scanning %s\n", url)
-			}
-			fr, content := fetchAndRun(url)
-			fr.Flows = nil
-			_ = content
-			// Keep successful CLI scans in history so diff mode works the same as the UI.
-			if !*diffMode && fr.Error == "" {
-				_ = history.Save(fr.AnalysisResult)
-			}
-			results[idx] = fr
-		}(i, u)
-	}
-	wg.Wait()
-
-	if *diffMode {
-		printDiff(results, *outFmt, !*noColor)
-		os.Exit(0)
-	}
-
-	sevOrder := map[string]int{"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
-	confOrder := map[string]int{"high": 3, "medium": 2, "low": 1}
-
-	for i := range results {
-		var kept []analyzer.Finding
-		for _, f := range results[i].Findings {
-			if *onlyHigh && f.Confidence != analyzer.ConfHigh {
-				continue
-			}
-			if *minConf != "" && confOrder[string(f.Confidence)] < confOrder[*minConf] {
-				continue
-			}
-			if *minSev != "" && sevOrder[string(f.Severity)] < sevOrder[*minSev] {
-				continue
-			}
-			kept = append(kept, f)
-		}
-		results[i].Findings = kept
-	}
-
-	switch *outFmt {
+	switch *formatFlag {
 	case "json":
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		if len(results) == 1 {
-			enc.Encode(results[0])
-		} else {
-			enc.Encode(results)
-		}
+		_ = enc.Encode(results)
 	case "plain":
 		printPlain(results)
 	default:
-		printTable(results, !*noColor)
+		printTable(results)
 	}
-
-	// Return a failing exit code when serious findings are present.
-	for _, r := range results {
-		for _, f := range r.Findings {
-			if f.Severity == analyzer.SevCritical || f.Severity == analyzer.SevHigh {
+	for _, result := range results {
+		if result.Error != "" {
+			os.Exit(1)
+		}
+		for _, finding := range result.Findings {
+			if finding.Severity == analyzer.SevCritical || finding.Severity == analyzer.SevHigh {
 				os.Exit(1)
 			}
 		}
 	}
 }
 
+func analyzeURLs(urls []string, workers int, silent bool) []analyzer.Result {
+	results := make([]analyzer.Result, len(urls))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, max(1, workers))
+	for i, raw := range urls {
+		wg.Add(1)
+		go func(idx int, value string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if !silent {
+				fmt.Fprintf(os.Stderr, "  fetching %s\n", value)
+			}
+			source, err := analyzer.LoadURL(value)
+			if err != nil {
+				results[idx] = analyzer.Result{
+					ID:       analyzer.SourceKey(analyzer.SourceURL, value),
+					Name:     value,
+					Kind:     analyzer.SourceURL,
+					Origin:   value,
+					Status:   "failed",
+					Findings: nil,
+					Summary: analyzer.Summary{
+						ByCategory:   map[string]int{},
+						BySeverity:   map[string]int{},
+						ByConfidence: map[string]int{},
+					},
+					Error: err.Error(),
+				}
+				return
+			}
+			results[idx] = analyzer.Analyze(source)
+			_ = history.Save(results[idx])
+		}(i, raw)
+	}
+	wg.Wait()
+	return results
+}
+
+func analyzeFiles(paths []string, silent bool) []analyzer.Result {
+	results := make([]analyzer.Result, 0, len(paths))
+	for _, path := range paths {
+		if !silent {
+			fmt.Fprintf(os.Stderr, "  analyzing %s\n", path)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			results = append(results, analyzer.Result{
+				ID:     analyzer.SourceKey(analyzer.SourceFile, path),
+				Name:   filepath.Base(path),
+				Kind:   analyzer.SourceFile,
+				Origin: path,
+				Status: "failed",
+				Summary: analyzer.Summary{
+					ByCategory:   map[string]int{},
+					BySeverity:   map[string]int{},
+					ByConfidence: map[string]int{},
+				},
+				Error: err.Error(),
+			})
+			continue
+		}
+		result := analyzer.Analyze(analyzer.SourceInput{
+			ID:      analyzer.SourceKey(analyzer.SourceFile, path),
+			Name:    filepath.Base(path),
+			Kind:    analyzer.SourceFile,
+			Origin:  path,
+			Content: string(body),
+		})
+		results = append(results, result)
+		_ = history.Save(result)
+	}
+	return results
+}
+
+func printTable(results []analyzer.Result) {
+	for _, result := range results {
+		fmt.Printf("\n%s\n", result.Name)
+		if result.Error != "" {
+			fmt.Printf("error: %s\n", result.Error)
+			continue
+		}
+		fmt.Printf("%d lines  %d findings  risk %s [%d/100]\n", result.LineCount, len(result.Findings), strings.ToUpper(result.Summary.RiskLabel), result.Summary.RiskScore)
+		writer := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(writer, "SEVERITY\tCONFIDENCE\tCATEGORY\tTYPE\tLINE\tVALUE")
+		for _, finding := range result.Findings {
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%d\t%s\n",
+				finding.Severity, finding.Confidence, finding.Category, finding.Title, finding.Line, truncate(finding.Value, 80))
+		}
+		_ = writer.Flush()
+	}
+}
+
+func printPlain(results []analyzer.Result) {
+	for _, result := range results {
+		for _, finding := range result.Findings {
+			fmt.Printf("%s\t%s\t%s\t%s\t%d\t%s\n",
+				result.Name, finding.Category, finding.Severity, finding.Title, finding.Line, finding.Value)
+		}
+		if result.Error != "" {
+			fmt.Printf("%s\terror\t-\t-\t0\t%s\n", result.Name, result.Error)
+		}
+	}
+}
+
+func printDiff(results []analyzer.Result, format string) {
+	type payload struct {
+		Result analyzer.Result    `json:"result"`
+		Diff   history.DiffResult `json:"diff"`
+		Error  string             `json:"error,omitempty"`
+	}
+	var out []payload
+	for _, result := range results {
+		diff, err := history.Diff(result)
+		item := payload{Result: result}
+		if err != nil {
+			item.Error = err.Error()
+		} else {
+			item.Diff = diff
+		}
+		out = append(out, item)
+	}
+	if format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(out)
+		return
+	}
+	for _, item := range out {
+		fmt.Printf("\n%s\n", item.Result.Name)
+		if item.Error != "" {
+			fmt.Printf("error: %s\n", item.Error)
+			continue
+		}
+		if item.Diff.IsFirstScan {
+			fmt.Printf("first scan: %d new findings\n", len(item.Diff.New))
+			continue
+		}
+		fmt.Printf("new: %d  gone: %d  unchanged: %d\n", len(item.Diff.New), len(item.Diff.Gone), item.Diff.Unchanged)
+	}
+}
+
+func printHistory() {
+	records, err := history.ListHistory()
+	exitIf(err)
+	if len(records) == 0 {
+		fmt.Println("No history yet.")
+		return
+	}
+	for _, record := range records {
+		fmt.Printf("%s\t%s\t%d findings\n", record.ScannedAt, record.Name, len(record.Findings))
+	}
+}
+
 func collectURLs(urlFlag, fileFlag string, args []string, stdinPiped bool) []string {
 	seen := map[string]bool{}
 	var urls []string
-	add := func(u string) {
-		u = strings.TrimSpace(u)
-		if u == "" || seen[u] {
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
 			return
 		}
-		seen[u] = true
-		urls = append(urls, u)
+		seen[value] = true
+		urls = append(urls, value)
 	}
 	if urlFlag != "" {
 		add(urlFlag)
 	}
-	for _, a := range args {
-		add(a)
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://") {
+			add(arg)
+		}
 	}
 	if fileFlag != "" {
-		data, err := os.ReadFile(fileFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error reading %s: %v\n", fileFlag, err)
-		} else {
-			for _, line := range strings.Split(string(data), "\n") {
-				add(line)
+		handle, err := os.Open(fileFlag)
+		if err == nil {
+			found, readErr := analyzer.ReadURLs(handle)
+			_ = handle.Close()
+			if readErr == nil {
+				for _, value := range found {
+					add(value)
+				}
 			}
 		}
 	}
 	if stdinPiped {
-		data, err := io.ReadAll(os.Stdin)
+		found, err := analyzer.ReadURLs(os.Stdin)
 		if err == nil {
-			for _, line := range strings.Split(string(data), "\n") {
-				add(line)
+			for _, value := range found {
+				add(value)
 			}
 		}
 	}
 	return urls
 }
 
-const (
-	cReset  = "\033[0m"
-	cRed    = "\033[31m"
-	cYellow = "\033[33m"
-	cGreen  = "\033[32m"
-	cCyan   = "\033[36m"
-	cGray   = "\033[90m"
-	cBold   = "\033[1m"
-	cOrange = "\033[38;5;208m"
-	cBlue   = "\033[34m"
-)
-
-func sevCol(s analyzer.Severity, c bool) string {
-	if !c {
-		return ""
+func collectJSFiles(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
 	}
-	switch s {
-	case analyzer.SevCritical:
-		return cRed + cBold
-	case analyzer.SevHigh:
-		return cOrange
-	case analyzer.SevMedium:
-		return cYellow
-	case analyzer.SevLow:
-		return cGreen
-	default:
-		return cGray
-	}
-}
-
-func confCol(cf analyzer.Confidence, c bool) string {
-	if !c {
-		return ""
-	}
-	switch cf {
-	case analyzer.ConfHigh:
-		return cGreen
-	case analyzer.ConfMedium:
-		return cYellow
-	default:
-		return cGray
-	}
-}
-
-func rst(c bool) string {
-	if !c {
-		return ""
-	}
-	return cReset
-}
-
-func printTable(results []fullResult, color bool) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-
-	// Show the riskiest files first.
-	sorted := make([]fullResult, len(results))
-	copy(sorted, results)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].RiskScore > sorted[j].RiskScore
-	})
-
-	for _, r := range sorted {
-		if r.Error != "" {
-			fmt.Fprintf(os.Stderr, "ERROR  %s: %s\n", r.URL, r.Error)
+	seen := map[string]bool{}
+	var out []string
+	parts := strings.Split(raw, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
 			continue
 		}
-		if len(r.Findings) == 0 {
-			if color {
-				fmt.Fprintf(w, "%s# %s — no findings%s\n", cGray, r.URL, cReset)
-			} else {
-				fmt.Fprintf(w, "# %s — no findings\n", r.URL)
-			}
-			continue
-		}
-
-		riskCol := cGreen
-		if color {
-			switch r.RiskLabel {
-			case "critical":
-				riskCol = cRed + cBold
-			case "high":
-				riskCol = cOrange
-			case "medium":
-				riskCol = cYellow
-			}
-		}
-
-		fmt.Fprintf(w, "\n%s%s%s\n", cBold, r.URL, rst(color))
-		fmt.Fprintf(w, "%s%d lines · %d findings · risk %s%s%s [%d/100]%s\n",
-			cGray, r.LineCount, len(r.Findings),
-			riskCol, r.RiskLabel, cGray, r.RiskScore, rst(color))
-		fmt.Fprintln(w, strings.Repeat("─", 90))
-
-		fmt.Fprintf(w, "%sSEV\tCONF\tCATEGORY\tTYPE\tVALUE%s\n", cBold, rst(color))
-		fmt.Fprintln(w, strings.Repeat("─", 90))
-		for _, f := range r.Findings {
-			val := f.Value
-			if len(val) > 55 {
-				val = val[:52] + "..."
-			}
-			note := ""
-			if f.Note != "" {
-				note = "  " + cGray + "# " + f.Note + rst(color)
-			}
-			fmt.Fprintf(w, "%s%-8s%s\t%s%-6s%s\t%-22s\t%-30s\t%s%s\n",
-				sevCol(f.Severity, color), strings.ToUpper(string(f.Severity)), rst(color),
-				confCol(f.Confidence, color), string(f.Confidence), rst(color),
-				f.Category, f.Type, val, note)
-		}
-		fmt.Fprintln(w)
-	}
-	w.Flush()
-
-	total, crit, high, med, low := 0, 0, 0, 0, 0
-	hc, mc, lc := 0, 0, 0
-	for _, r := range results {
-		for _, f := range r.Findings {
-			total++
-			switch f.Severity {
-			case analyzer.SevCritical:
-				crit++
-			case analyzer.SevHigh:
-				high++
-			case analyzer.SevMedium:
-				med++
-			default:
-				low++
-			}
-			switch f.Confidence {
-			case analyzer.ConfHigh:
-				hc++
-			case analyzer.ConfMedium:
-				mc++
-			default:
-				lc++
-			}
-		}
-	}
-	fmt.Printf("\n%s── Summary %s%s\n", cBold, strings.Repeat("─", 60), rst(color))
-	fmt.Printf("  Files:    %d\n", len(results))
-	fmt.Printf("  Findings: %d total  (%s%d crit%s  %s%d high%s  %s%d med%s  %d low/info)\n",
-		total,
-		cRed+cBold, crit, rst(color),
-		cOrange, high, rst(color),
-		cYellow, med, rst(color), low)
-	fmt.Printf("  Confidence: %s%d high%s  %s%d medium%s  %s%d low%s\n",
-		cGreen, hc, rst(color), cYellow, mc, rst(color), cGray, lc, rst(color))
-}
-
-func printPlain(results []fullResult) {
-	for _, r := range results {
-		if r.Error != "" {
-			fmt.Fprintf(os.Stderr, "ERROR\t%s\t%s\n", r.URL, r.Error)
-			continue
-		}
-		for _, f := range r.Findings {
-			fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\tL%d\n",
-				r.URL, f.Severity, f.Confidence, f.Category, f.Type, f.Value, f.Line)
-		}
-	}
-}
-
-func printDiff(results []fullResult, outFmt string, color bool) {
-	for _, r := range results {
-		if r.Error != "" {
-			fmt.Fprintf(os.Stderr, "ERROR  %s: %s\n", r.URL, r.Error)
-			continue
-		}
-		dr, err := history.Diff(r.AnalysisResult)
+		info, err := os.Stat(part)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "diff error for %s: %v\n", r.URL, err)
 			continue
 		}
-		if outFmt == "json" {
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			enc.Encode(dr)
+		if info.IsDir() {
+			entries, _ := os.ReadDir(part)
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".js") {
+					continue
+				}
+				full := filepath.Join(part, entry.Name())
+				if !seen[full] {
+					seen[full] = true
+					out = append(out, full)
+				}
+			}
 			continue
 		}
-		if dr.IsFirstScan {
-			fmt.Fprintf(os.Stderr, "%s[first scan — no previous baseline]%s %s\n",
-				cGray, rst(color), r.URL)
-		} else {
-			fmt.Printf("\n%s%s%s\n", cBold, r.URL, rst(color))
-			fmt.Printf("  previous scan: %s\n", dr.PreviousScan)
-			fmt.Printf("  %s%d new%s  %d gone  %d unchanged\n",
-				cRed+cBold, len(dr.New), rst(color), len(dr.Gone), dr.Unchanged)
-		}
-		for _, f := range dr.New {
-			fmt.Printf("  %s+ NEW%s  %s%-8s%s  %s  %s\n",
-				cGreen+cBold, rst(color),
-				sevCol(f.Severity, color), strings.ToUpper(string(f.Severity)), rst(color),
-				f.Type, f.Value)
-		}
-		for _, f := range dr.Gone {
-			fmt.Printf("  %s- GONE%s %s%-8s%s  %s  %s\n",
-				cGray, rst(color),
-				sevCol(f.Severity, color), strings.ToUpper(string(f.Severity)), rst(color),
-				f.Type, f.Value)
+		if !seen[part] {
+			seen[part] = true
+			out = append(out, part)
 		}
 	}
+	sort.Strings(out)
+	return out
+}
+
+func truncate(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
 }
 
 func isStdinPiped() bool {
-	fi, err := os.Stdin.Stat()
+	stat, err := os.Stdin.Stat()
 	if err != nil {
 		return false
 	}
-	return (fi.Mode() & os.ModeCharDevice) == 0
+	return (stat.Mode() & os.ModeCharDevice) == 0
+}
+
+func exitIf(err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "error:", err)
+	os.Exit(1)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

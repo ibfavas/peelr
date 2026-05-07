@@ -1,697 +1,498 @@
-const VERSION = "v1.1.0";
+const VERSION = "2.0.0";
 
-const CATS = {
-  api_keys: { icon: "🔑", label: "API Keys & Tokens", hint: "Stripe, AWS, Google, GitHub, JWT…" },
-  credentials: { icon: "🔒", label: "Credentials", hint: "Passwords, Basic Auth, DB strings, private keys" },
-  xss: { icon: "⚡", label: "XSS Sinks", hint: "innerHTML, eval, document.write, dangerouslySetInnerHTML…" },
-  dom_sinks: { icon: "🕳️", label: "DOM Sinks", hint: "document.domain, postMessage, srcdoc, script.src…" },
-  prototype_pollution: { icon: "☣️", label: "Prototype Pollution", hint: "__proto__ writes, Object.assign taint, lodash merge…" },
-  graphql: { icon: "◈", label: "GraphQL", hint: "/graphql endpoints, queries, mutations, introspection" },
-  endpoints: { icon: "🌐", label: "Endpoints & APIs", hint: "fetch(), axios, XHR, jQuery AJAX calls, API paths" },
-  emails: { icon: "✉️", label: "Email Addresses", hint: "" },
-  paths: { icon: "📂", label: "File Paths", hint: "Unix/Windows paths, S3 bucket references" },
-  comments: { icon: "💬", label: "Dev Comments", hint: "TODO, FIXME, security-related, credential-related comments" },
+const CATEGORY_LABELS = {
+  api_keys: "API Keys",
+  credentials: "Credentials",
+  emails: "Emails",
+  xss: "XSS",
+  endpoints: "API Endpoints",
+  parameters: "Parameters",
+  paths: "Paths",
+  comments: "Comments",
 };
 
-const SIDEBAR_ORDER = [
-  "api_keys",
-  "credentials",
-  "xss",
-  "dom_sinks",
-  "prototype_pollution",
-  "graphql",
-  "endpoints",
-  "emails",
-  "paths",
-  "comments",
-];
+const SEVERITIES = ["critical", "high", "medium", "low", "info"];
 
-const STATS = [
-  { id: "total", label: "Total Findings", hint: "all files combined", className: "num-total" },
-  { id: "critical", label: "🔴 Critical", hint: "report immediately", className: "num-crit" },
-  { id: "high", label: "🟠 High", hint: "verify & report", className: "num-high" },
-  { id: "medium", label: "🟡 Medium", hint: "worth reviewing", className: "num-med" },
-  { id: "low", label: "🟢 Low / Info", hint: "context dependent", className: "num-low" },
-  { id: "files", label: "Files Scanned", hint: "JS files processed", className: "num-files" },
-];
-
-const SEVERITY_FILTERS = [
-  { value: "critical", label: "🔴 Critical" },
-  { value: "high", label: "🟠 High" },
-  { value: "medium", label: "🟡 Medium" },
-  { value: "low", label: "🟢 Low" },
-  { value: "info", label: "ℹ Info" },
-];
-
-const LEGEND_ITEMS = [
-  { color: "var(--red)", text: "Severity = impact if exploited" },
-  { color: "var(--green)", text: "Confidence HIGH = low false positive" },
-  { color: "var(--yellow)", text: "Confidence LOW = verify manually" },
-];
-
-const results = [];
-const F = {
-  sev: new Set(SEVERITY_FILTERS.map((item) => item.value)),
-  cat: null,
-  q: "",
+const state = {
+  job: null,
+  polling: null,
+  renderToken: "",
+  expandedResults: new Set(),
+  visibleResultLimit: 18,
+  queryTimer: null,
+  filters: {
+    category: "api_keys",
+    severity: "high",
+    query: "",
+    includeLowSignal: false,
+  },
 };
 
-document.addEventListener("DOMContentLoaded", () => {
-  renderShell();
-  initTheme();
-  bindShellEvents();
-});
+window.addEventListener("DOMContentLoaded", boot);
 
-function renderShell() {
-  document.getElementById("app").innerHTML = `
-    <div class="app">
-      <header class="header">
-        <a class="logo" href="/">
-          <div class="logo-icon">🧅</div>
-          <div>
-            <div class="logo-name">Peelr</div>
-            <div class="logo-sub">JavaScript Security Scanner</div>
-          </div>
-        </a>
-        <div class="header-gap"></div>
-        <div class="header-end">
-          <div class="server-pill">
-            <div class="server-dot"></div>
-            Go · ${VERSION}
-          </div>
-          <button class="theme-btn" id="theme-btn" title="Switch dark / light mode">🌙</button>
-        </div>
-      </header>
-      <aside class="sidebar">
-        <div class="sb-group">
-          <div class="sb-group-label">Scanner</div>
-          <button class="sb-btn active" id="nav-scanner" data-nav="scanner">
-            <span class="sb-icon">🔍</span> Scan Files
-          </button>
-        </div>
-        <div class="sb-divider"></div>
-        <div class="sb-group">
-          <div class="sb-group-label">Filter by Category</div>
-          ${SIDEBAR_ORDER.map(renderSidebarButton).join("")}
-        </div>
-        <div class="sb-divider"></div>
-        <div class="sb-group">
-          <div class="sb-group-label">Actions</div>
-          <button class="sb-btn" data-action="export">
-            <span class="sb-icon">⬇</span> Export as JSON
-          </button>
-          <button class="sb-btn" data-action="clear">
-            <span class="sb-icon">🗑</span> Clear Results
-          </button>
-        </div>
-      </aside>
-      <main class="main">
-        <div class="scan-panel">
-          <div class="scan-heading">Scan JavaScript Files</div>
-          <div class="scan-subtext">
-            Paste a <code>.js</code> URL to scan for API keys, hardcoded credentials, XSS sinks, prototype pollution gadgets, GraphQL endpoints, and more.
-            Each finding shows a <strong>severity</strong> (impact) and <strong>confidence</strong> (likelihood of being a real issue).
-          </div>
-          <div class="tabs">
-            <button class="tab-btn active" data-tab-target="single">Single URL</button>
-            <button class="tab-btn" data-tab-target="batch">Batch (up to 50 URLs)</button>
-          </div>
-          <div class="tab-pane active" id="pane-single">
-            <div class="input-row">
-              <input class="url-input" id="inp-single" type="url" placeholder="https://target.com/assets/app.min.js  — press Enter to scan">
-              <label class="diff-label" title="Compare findings with the last scan of this URL to see what changed">
-                <input type="checkbox" id="diff-mode"> Show diff
-              </label>
-              <button class="btn btn-primary" id="btn-single">Analyze →</button>
-            </div>
-          </div>
-          <div class="tab-pane" id="pane-batch">
-            <textarea class="url-textarea" id="inp-batch" placeholder="One URL per line:&#10;https://target.com/chunk.abc123.js&#10;https://target.com/vendor.js&#10;https://cdn.example.com/app.js"></textarea>
-            <div class="input-row">
-              <button class="btn btn-primary" id="btn-batch">Analyze All →</button>
-              <button class="btn btn-ghost" id="btn-clear-batch">Clear</button>
-            </div>
-          </div>
-          <div class="prog-wrap" id="prog-wrap">
-            <div class="prog-track"><div class="prog-fill" id="prog-fill"></div></div>
-          </div>
-          <div class="prog-text" id="prog-text"></div>
-        </div>
-        <div class="stats-bar">
-          ${STATS.map(renderStatCell).join("")}
-        </div>
-        <div class="results-area">
-          <div class="filter-bar" id="filter-bar" style="display:none">
-            <span class="filter-label">Show severity:</span>
-            <div class="filter-sep"></div>
-            ${SEVERITY_FILTERS.map(renderSeverityChip).join("")}
-            <input class="search-input" id="search-input" placeholder="🔎 Search findings…">
-          </div>
-          <div class="legend-bar" id="legend-bar" style="display:none">
-            <span style="font-weight:600;color:var(--text-muted)">Reading results:</span>
-            ${LEGEND_ITEMS.map(renderLegendItem).join("")}
-          </div>
-          <div class="empty-state" id="empty-state">
-            <div class="empty-icon">🧅</div>
-            <div class="empty-title">Ready to scan</div>
-            <div class="empty-body">
-              Paste any <code>.js</code> URL above and press <strong>Enter</strong> or click <strong>Analyze →</strong>.<br><br>
-              Peelr will check for API keys, hardcoded passwords, XSS sinks, prototype pollution gadgets, GraphQL endpoints, and more.<br><br>
-              Each finding shows its <strong>severity</strong> (how bad if real) and <strong>confidence</strong> (how likely it's a real issue, not a false positive).
-            </div>
-          </div>
-          <div id="results-container"></div>
-        </div>
-      </main>
-    </div>
-  `;
-}
-
-function renderSidebarButton(cat) {
-  const meta = CATS[cat];
-  const title = meta.hint ? ` title="${x(meta.hint)}"` : "";
-  return `
-    <button class="sb-btn" id="nav-${cat}" data-cat="${cat}"${title}>
-      <span class="sb-icon">${meta.icon}</span> ${meta.label}
-      <span class="sb-badge" id="cnt-${cat}">0</span>
-    </button>
-  `;
-}
-
-function renderStatCell(item) {
-  return `
-    <div class="stat-cell">
-      <div class="stat-label">${item.label}</div>
-      <div class="stat-num ${item.className}" id="s-${item.id}">0</div>
-      <div class="stat-hint">${item.hint}</div>
-    </div>
-  `;
-}
-
-function renderSeverityChip(item) {
-  return `<button class="sev-chip on" data-sev="${item.value}">${item.label}</button>`;
-}
-
-function renderLegendItem(item) {
-  const dot = item.color ? `<span class="legend-dot" style="background:${item.color}"></span>` : "";
-  return `<span class="legend-item">${dot}${item.text}</span>`;
-}
-
-function bindShellEvents() {
-  document.getElementById("theme-btn").addEventListener("click", toggleTheme);
-  document.getElementById("btn-single").addEventListener("click", runSingle);
-  document.getElementById("btn-batch").addEventListener("click", runBatch);
-  document.getElementById("btn-clear-batch").addEventListener("click", clearAll);
-  document.getElementById("inp-single").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") runSingle();
-  });
-  document.getElementById("search-input").addEventListener("input", (event) => {
-    F.q = event.target.value;
-    render();
-  });
-
-  document.querySelectorAll("[data-tab-target]").forEach((btn) => {
-    btn.addEventListener("click", () => switchTab(btn.dataset.tabTarget, btn));
-  });
-
-  document.querySelectorAll(".sev-chip").forEach((btn) => {
-    btn.addEventListener("click", () => toggleSev(btn));
-  });
-
-  document.querySelectorAll("[data-cat]").forEach((btn) => {
-    btn.addEventListener("click", () => filterCat(btn.dataset.cat, btn));
-  });
-
-  document.querySelector('[data-action="export"]').addEventListener("click", exportJSON);
-  document.querySelector('[data-action="clear"]').addEventListener("click", clearAll);
-}
-
-function initTheme() {
-  const saved = localStorage.getItem("peelr-theme") || "dark";
-  document.documentElement.setAttribute("data-theme", saved);
-  syncThemeButton(saved);
-}
-
-function toggleTheme() {
-  const current = document.documentElement.getAttribute("data-theme");
-  const next = current === "dark" ? "light" : "dark";
-  document.documentElement.setAttribute("data-theme", next);
-  localStorage.setItem("peelr-theme", next);
-  syncThemeButton(next);
-}
-
-function syncThemeButton(theme) {
-  const btn = document.getElementById("theme-btn");
-  if (btn) btn.textContent = theme === "dark" ? "🌙" : "☀️";
-}
-
-function switchTab(name, btn) {
-  document.querySelectorAll(".tab-btn").forEach((item) => item.classList.remove("active"));
-  document.querySelectorAll(".tab-pane").forEach((pane) => pane.classList.remove("active"));
-  btn.classList.add("active");
-  document.getElementById(`pane-${name}`).classList.add("active");
-}
-
-async function runSingle() {
-  const url = document.getElementById("inp-single").value.trim();
-  if (!url) {
-    toast("Please paste a JavaScript URL.", "err");
-    return;
-  }
-
-  const diff = document.getElementById("diff-mode").checked;
-  setLoading(true, diff ? "Scanning and comparing with previous scan…" : "Fetching and scanning…");
+function boot() {
+  const app = document.getElementById("app");
+  if (!app) return;
 
   try {
-    const res = await fetch("/api/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, diff }),
-    });
-    const data = await res.json();
-    if (data.error) {
-      toast(`Error: ${data.error}`, "err");
-      return;
-    }
-    if (diff && data.diff) {
-      renderDiff(data.diff, url);
-    } else {
-      addResult(data);
-      const findings = (data.findings || []).length;
-      toast(`Scan complete: ${findings} finding${findings !== 1 ? "s" : ""}`, "ok");
-    }
+    app.innerHTML = buildMarkup();
+    bindEvents();
   } catch (error) {
-    toast(`Network error: ${error.message}`, "err");
-  } finally {
-    setLoading(false);
-  }
-}
-
-async function runBatch() {
-  const raw = document.getElementById("inp-batch").value.trim();
-  if (!raw) {
-    toast("Please enter at least one URL.", "err");
-    return;
-  }
-
-  const urls = raw.split("\n").map((line) => line.trim()).filter(Boolean);
-  if (urls.length > 50) {
-    toast("Maximum 50 URLs per batch.", "err");
-    return;
-  }
-
-  setLoading(true, `Scanning ${urls.length} file${urls.length > 1 ? "s" : ""} concurrently…`);
-  setProgress(15);
-
-  try {
-    const res = await fetch("/api/analyze/batch", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ urls }),
-    });
-    setProgress(80);
-    const data = await res.json();
-    if (data.error) {
-      toast(`Error: ${data.error}`, "err");
-      return;
-    }
-    (data.results || []).forEach((result) => addResult(result));
-    setProgress(100);
-    toast(`Batch complete: ${data.succeeded}/${data.total} files succeeded · ${data.duration}`, "ok");
-  } catch (error) {
-    toast(`Network error: ${error.message}`, "err");
-  } finally {
-    setLoading(false);
-  }
-}
-
-function addResult(result) {
-  results.push(result);
-  updateStats();
-  updateSidebarCounts();
-  render();
-  document.getElementById("filter-bar").style.display = "";
-  document.getElementById("legend-bar").style.display = "";
-  document.getElementById("empty-state").style.display = "none";
-}
-
-function render() {
-  const container = document.getElementById("results-container");
-  container.innerHTML = "";
-  const q = F.q.toLowerCase();
-  const sorted = results.slice().sort((a, b) => (b.risk_score || 0) - (a.risk_score || 0));
-
-  sorted.forEach((result) => {
-    const idx = results.indexOf(result);
-    const filtered = (result.findings || []).filter((finding) => {
-      if (!F.sev.has(finding.severity)) return false;
-      if (F.cat && finding.category !== F.cat) return false;
-      if (q && !finding.value.toLowerCase().includes(q) && !finding.type.toLowerCase().includes(q)) return false;
-      return true;
-    });
-
-    container.appendChild(buildFileCard(result, filtered, idx));
-  });
-}
-
-function buildFileCard(result, filtered, idx) {
-  const card = document.createElement("div");
-  card.className = "file-card";
-
-  const isErr = !!result.error;
-  const riskLabel = result.risk_label || "minimal";
-  const riskScore = result.risk_score || 0;
-
-  card.innerHTML = `
-    <div class="file-header" title="Click to expand / collapse">
-      <div class="file-status ${isErr ? "st-err" : "st-ok"}" title="${isErr ? "Fetch failed" : "Fetched successfully"}"></div>
-      <div class="file-url">${x(result.url)}</div>
-      <div class="file-badges">
-        <span class="risk-badge risk-${riskLabel}" title="Risk score ${riskScore}/100">
-          Risk: ${riskLabel.toUpperCase()} (${riskScore})
-        </span>
-        <span class="meta-badge mb-findings">${filtered.length} finding${filtered.length !== 1 ? "s" : ""}</span>
-        <span class="meta-badge mb-lines">${result.line_count || 0} lines</span>
-      </div>
-      <div class="collapse-chevron">▾</div>
-    </div>
-  `;
-
-  const body = document.createElement("div");
-  body.className = "file-body";
-
-  if (isErr) {
-    body.innerHTML = `<div style="padding:14px 16px;font-size:12px;color:var(--red);font-family:'JetBrains Mono',monospace">⚠ Fetch failed: ${x(result.error)}</div>`;
-  } else {
-    const byCat = {};
-    filtered.forEach((finding) => {
-      (byCat[finding.category] = byCat[finding.category] || []).push(finding);
-    });
-
-    Object.entries(byCat).forEach(([cat, items]) => {
-      body.appendChild(buildCategoryGroup(cat, items, idx));
-    });
-
-    if (!filtered.length) {
-      body.innerHTML = `<div style="padding:14px 16px;font-size:12px;color:var(--text-dim)">No findings match the current filters.</div>`;
-    }
-  }
-
-  card.appendChild(body);
-  card.querySelector(".file-header").addEventListener("click", () => card.classList.toggle("closed"));
-  return card;
-}
-
-function buildCategoryGroup(cat, items, idx) {
-  const meta = CATS[cat] || { icon: "•", label: cat };
-  const group = document.createElement("div");
-  group.className = "cat-group";
-  group.innerHTML = `
-    <div class="cat-header">
-      <span class="cat-emoji">${meta.icon}</span>
-      <span class="cat-title">${meta.label}</span>
-      <span class="cat-count-badge">${items.length} found</span>
-      <span class="cat-chev">▾</span>
-    </div>
-    <div class="cat-body">
-      ${items.map((finding, itemIndex) => buildFindingRow(finding, idx, cat, itemIndex)).join("")}
-    </div>
-  `;
-
-  group.querySelector(".cat-header").addEventListener("click", () => {
-    group.classList.toggle("closed");
-  });
-
-  group.querySelectorAll("[data-copy]").forEach((btn) => {
-    btn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      copyText(btn.dataset.copy);
-    });
-  });
-
-  group.querySelectorAll("[data-toggle-ctx]").forEach((btn) => {
-    btn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      toggleCtx(btn.dataset.toggleCtx);
-    });
-  });
-
-  group.querySelectorAll(".finding-value[data-copy]").forEach((value) => {
-    value.addEventListener("click", (event) => {
-      event.stopPropagation();
-      copyText(value.dataset.copy);
-    });
-  });
-
-  return group;
-}
-
-function buildFindingRow(finding, idx, cat, itemIndex) {
-  const ctxId = `ctx-${idx}-${cat}-${itemIndex}`;
-  const confidence = finding.confidence || "low";
-  const safeCopy = attrEscape(finding.value);
-  return `
-    <div class="finding-row">
-      <div>
-        <span class="sev-badge sev-${finding.severity}" title="Severity: how bad this could be if it's a real issue">${finding.severity}</span>
-      </div>
-      <div>
-        <span class="conf-badge conf-${confidence}" title="Confidence: how likely this is a real finding vs noise">${confidence}</span>
-      </div>
-      <div class="finding-type" title="Pattern that matched">${x(finding.type)}</div>
-      <div class="finding-value" data-copy="${safeCopy}" title="Click to copy">${x(finding.value)}</div>
-      <div class="finding-actions">
-        <button class="act-btn" data-toggle-ctx="${ctxId}" title="Show the line of code where this was found">Line</button>
-        <button class="act-btn" data-copy="${safeCopy}" title="Copy value to clipboard">Copy</button>
-      </div>
-      ${finding.note ? `<div class="finding-note">${x(finding.note)}</div>` : ""}
-      <div class="code-context" id="${ctxId}">
-        <span class="line-num">Line ${finding.line}:</span>${x(finding.context)}
-      </div>
-    </div>
-  `;
-}
-
-function renderDiff(diff, url) {
-  document.getElementById("empty-state").style.display = "none";
-  document.getElementById("filter-bar").style.display = "";
-  document.getElementById("legend-bar").style.display = "";
-
-  const newCount = (diff.new || []).length;
-  const goneCount = (diff.gone || []).length;
-  const card = document.createElement("div");
-  card.className = "diff-card";
-
-  card.innerHTML = `
-    <div class="diff-header">
-      <div class="file-status st-ok"></div>
-      <div class="file-url">${x(url)}</div>
-      <div class="file-badges">
-        <span class="meta-badge" style="background:var(--green-bg);color:var(--green)">Δ Diff Result</span>
-        ${newCount ? `<span class="meta-badge mb-findings">+${newCount} new</span>` : ""}
-        ${goneCount ? `<span class="meta-badge mb-lines">−${goneCount} gone</span>` : ""}
-      </div>
-      <div class="collapse-chevron">▾</div>
-    </div>
-  `;
-
-  const body = document.createElement("div");
-  body.className = "diff-body";
-
-  if (diff.is_first_scan) {
-    body.innerHTML = `
-      <div style="padding:16px;font-size:13px;color:var(--text-muted)">
-        This is the first scan of this URL — Peelr has saved it as the baseline.
-        Run again with "Show diff" to see what changes next time.
+    app.innerHTML = `
+      <div style="padding:24px;color:#fff;font-family:monospace">
+        <h2>Peelr UI failed to load</h2>
+        <pre>${escapeHtml(String(error && error.stack ? error.stack : error))}</pre>
       </div>
     `;
-  } else {
-    let html = `<div class="diff-meta">Compared with scan from ${x(diff.previous_scan)} · ${diff.unchanged} findings unchanged</div>`;
-
-    if (newCount) {
-      html += `<div class="diff-section-title new-section">⬆ New findings since last scan — investigate these</div>`;
-      html += (diff.new || []).map((finding) => renderDiffRow(finding, "new")).join("");
-    }
-
-    if (goneCount) {
-      html += `<div class="diff-section-title gone-section">⬇ Removed since last scan — possibly fixed or rotated</div>`;
-      html += (diff.gone || []).map((finding) => renderDiffRow(finding, "gone")).join("");
-    }
-
-    if (!newCount && !goneCount) {
-      html += `<div class="no-changes">✓ No changes detected since the last scan.</div>`;
-    }
-
-    body.innerHTML = html;
   }
-
-  card.appendChild(body);
-  card.querySelector(".diff-header").addEventListener("click", () => {
-    body.style.display = body.style.display === "none" ? "" : "none";
-  });
-  body.querySelectorAll("[data-copy]").forEach((btn) => {
-    btn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      copyText(btn.dataset.copy);
-    });
-  });
-  document.getElementById("results-container").prepend(card);
-  toast(`Diff complete: ${newCount} new, ${goneCount} gone`, "ok");
 }
 
-function renderDiffRow(finding, kind) {
-  const confidence = finding.confidence || "low";
-  const safeCopy = attrEscape(finding.value);
-  const style = kind === "new" ? ` style="background:rgba(63,185,80,0.04)"` : ` style="opacity:0.45"`;
-  const valueStyle = kind === "gone" ? ` style="text-decoration:line-through"` : "";
-  const action = kind === "new"
-    ? `<div class="finding-actions"><button class="act-btn" data-copy="${safeCopy}">Copy</button></div>`
-    : "<div></div>";
-
+function buildMarkup() {
   return `
-    <div class="finding-row"${style}>
-      <div><span class="sev-badge sev-${finding.severity}">${finding.severity}</span></div>
-      <div><span class="conf-badge conf-${confidence}">${confidence}</span></div>
-      <div class="finding-type">${x(finding.type)}</div>
-      <div class="finding-value"${valueStyle}>${x(finding.value)}</div>
-      ${action}
+    <div class="app-shell">
+      <section class="hero-window">
+        <div class="hero-bar">
+          <div class="hero-dots"><span></span><span></span><span></span></div>
+          <div class="hero-title">peelr://${VERSION}</div>
+        </div>
+        <div class="hero-body">
+          <div class="brand-panel">
+            <pre class="ascii">    ____            __
+   / __ \\___  ___  / /____
+  / /_/ / _ \\/ _ \\/ / ___/
+ / ____/  __/  __/ / /
+/_/    \\___/\\___/_/_/</pre>
+            <div class="hero-copy">
+              <h1>JavaScript Recon Console</h1>
+              <p>Paste JavaScript URLs directly or upload a JavaScript URL list for focused analysis without domain discovery overhead.</p>
+            </div>
+          </div>
+
+          <div class="fastfetch-panel">
+            ${fastfetchRow("engine", "go stdlib")}
+            ${fastfetchRow("input", "javascript urls only")}
+            ${fastfetchRow("upload", "txt, csv, list")}
+            ${fastfetchRow("focus", "secrets, xss, endpoints, params")}
+            ${fastfetchRow("output", "live grouped results with show code")}
+            ${fastfetchRow("theme", "cyberpunk terminal")}
+          </div>
+        </div>
+
+      </section>
+
+      <section class="control-window">
+        <div class="window-head">
+          <div>
+            <h2>Scan JavaScript URLs</h2>
+            <p>Provide one or more direct JavaScript URLs. Peelr fetches each file and analyzes the result.</p>
+          </div>
+          <div class="head-badge">dark console ui</div>
+        </div>
+
+        <div class="command-strip">
+          <span class="prompt">guest@peelr:~$</span>
+          <span>analyze js-urls --fetch</span>
+        </div>
+
+        <div class="mode-panel" id="pane-js">
+          <div class="field-grid">
+            <label class="input-block wide">
+              <span>JavaScript URLs</span>
+              <textarea id="js-urls-input" placeholder="https://target.com/app.js&#10;https://cdn.target.com/vendor.min.js"></textarea>
+              <small>Paste direct JavaScript URLs. Peelr will fetch and analyze each file.</small>
+            </label>
+            <div class="input-block">
+              <span>Upload JS URL list</span>
+              ${uploadBox("js-upload-btn", "js-files", "js-upload-name", "Choose list")}
+              <small>Accepts one JavaScript URL per line.</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions-row">
+          <button id="run-btn" class="run-btn">Run Analysis</button>
+          <div id="run-meta" class="run-meta">idle</div>
+        </div>
+      </section>
+
+      <section class="status-window">
+        <div class="stats-row">
+          ${statCard("sources", "0", "js files queued")}
+          ${statCard("processed", "0", "finished scans")}
+          ${statCard("findings", "0", "total matches")}
+          ${statCard("high risk", "0", "critical or high")}
+        </div>
+
+        <div class="runtime-card">
+          <div class="window-head compact">
+            <h2>Runtime</h2>
+            <div id="job-status" class="status-pill idle">waiting</div>
+          </div>
+          <div class="runtime-log">
+            <div><span class="prompt">log&gt;</span> scheduler ready</div>
+            <div id="job-summary">No analysis has been started.</div>
+          </div>
+          <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+        </div>
+      </section>
+
+      <section class="results-window">
+        <div class="window-head">
+          <div>
+            <h2>Analysis Results</h2>
+            <p>High-signal findings are prioritized by default. Low and info items stay available without flooding the browser.</p>
+          </div>
+          <div class="results-controls">
+            <label class="search-block">
+              <span>Search</span>
+              <input id="filter-query" type="text" placeholder="token, innerHTML, /api, email">
+            </label>
+            <button id="low-signal-toggle" class="chip-btn secondary-chip" type="button">Include Lower-Signal</button>
+          </div>
+        </div>
+
+        <div class="filter-stack">
+          <div class="button-group wrap">${categoryButtons()}</div>
+          <div class="button-group wrap">${severityButtons()}</div>
+        </div>
+
+        <div id="results" class="results-list">
+          <div class="empty-state">
+            <div class="empty-title">Ready</div>
+            <p>Run a scan and the JavaScript URL analysis will appear here.</p>
+          </div>
+        </div>
+      </section>
     </div>
   `;
 }
 
-function updateStats() {
-  let total = 0;
-  let critical = 0;
-  let high = 0;
-  let medium = 0;
-  let low = 0;
-
-  results.forEach((result) => {
-    (result.findings || []).forEach((finding) => {
-      total++;
-      if (finding.severity === "critical") critical++;
-      else if (finding.severity === "high") high++;
-      else if (finding.severity === "medium") medium++;
-      else low++;
-    });
-  });
-
-  $t("s-total", total);
-  $t("s-critical", critical);
-  $t("s-high", high);
-  $t("s-medium", medium);
-  $t("s-low", low);
-  $t("s-files", results.length);
+function categoryButtons() {
+  return Object.keys(CATEGORY_LABELS).map((key) => {
+    const active = key === "api_keys" ? "active" : "";
+    return `<button class="chip-btn ${active}" data-category="${key}">${CATEGORY_LABELS[key]}</button>`;
+  }).join("");
 }
 
-function updateSidebarCounts() {
-  const counts = {};
-  results.forEach((result) => {
-    (result.findings || []).forEach((finding) => {
-      counts[finding.category] = (counts[finding.category] || 0) + 1;
-    });
-  });
+function severityButtons() {
+  return SEVERITIES.map((severity) => {
+    const active = severity === "high" ? "active" : "";
+    return `<button class="chip-btn ${active}" data-severity="${severity}">${capitalize(severity)}</button>`;
+  }).join("");
+}
 
-  Object.keys(CATS).forEach((cat) => {
-    const el = document.getElementById(`cnt-${cat}`);
-    if (el) el.textContent = counts[cat] || 0;
+function fastfetchRow(label, value) {
+  return `<div class="fastfetch-row"><span>${label}</span><strong>${value}</strong></div>`;
+}
+
+function featureCard(label, value) {
+  return `<div class="feature-card"><div class="feature-title">${label}</div><div class="feature-text">${value}</div></div>`;
+}
+
+function statCard(label, value, hint) {
+  return `<div class="stat-card"><span>${label}</span><strong data-stat="${label}">${value}</strong><small>${hint}</small></div>`;
+}
+
+function uploadBox(buttonId, inputId, nameId, buttonLabel) {
+  return `
+    <div class="upload-box">
+      <input id="${inputId}" class="hidden-file" type="file" multiple accept=".txt,.csv,.list">
+      <button id="${buttonId}" type="button" class="upload-btn">${buttonLabel}</button>
+      <div id="${nameId}" class="upload-name">No file selected</div>
+    </div>
+  `;
+}
+
+function bindEvents() {
+  document.querySelectorAll("[data-category]").forEach((btn) => {
+    btn.addEventListener("click", () => setCategory(btn.dataset.category));
+  });
+  document.querySelectorAll("[data-severity]").forEach((btn) => {
+    btn.addEventListener("click", () => setSeverity(btn.dataset.severity));
+  });
+  byId("filter-query").addEventListener("input", (event) => {
+    clearTimeout(state.queryTimer);
+    state.queryTimer = setTimeout(() => {
+      state.filters.query = event.target.value.trim().toLowerCase();
+      renderResults();
+    }, 120);
+  });
+  byId("low-signal-toggle").addEventListener("click", toggleLowSignal);
+  byId("run-btn").addEventListener("click", startJob);
+  bindUploadPicker("js-upload-btn", "js-files", "js-upload-name");
+  byId("results").addEventListener("click", handleResultsClick);
+}
+
+function bindUploadPicker(buttonId, inputId, nameId) {
+  const button = byId(buttonId);
+  const input = byId(inputId);
+  const name = byId(nameId);
+  if (!button || !input || !name) return;
+  button.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => {
+    name.textContent = input.files.length
+      ? Array.from(input.files).map((file) => file.name).join(", ")
+      : "No file selected";
   });
 }
 
-function toggleSev(btn) {
-  const severity = btn.dataset.sev;
-  if (F.sev.has(severity)) {
-    F.sev.delete(severity);
-    btn.classList.remove("on");
-  } else {
-    F.sev.add(severity);
-    btn.classList.add("on");
+function setCategory(category) {
+  state.filters.category = category;
+  document.querySelectorAll("[data-category]").forEach((btn) => btn.classList.toggle("active", btn.dataset.category === category));
+  renderResults();
+}
+
+function setSeverity(severity) {
+  state.filters.severity = severity;
+  document.querySelectorAll("[data-severity]").forEach((btn) => btn.classList.toggle("active", btn.dataset.severity === severity));
+  renderResults();
+}
+
+function toggleLowSignal() {
+  state.filters.includeLowSignal = !state.filters.includeLowSignal;
+  byId("low-signal-toggle").classList.toggle("active", state.filters.includeLowSignal);
+  byId("low-signal-toggle").textContent = state.filters.includeLowSignal ? "Hide Lower-Signal" : "Include Lower-Signal";
+  renderResults();
+}
+
+async function startJob() {
+  const formData = new FormData();
+  formData.append("mode", "js");
+  formData.append("urls", byId("js-urls-input").value);
+  for (const file of byId("js-files").files) {
+    formData.append("uploads", file);
   }
-  render();
+
+  setRunState("submitting");
+  try {
+    const response = await fetch("/api/jobs", { method: "POST", body: formData });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "unable to create job");
+    }
+    state.job = null;
+    state.expandedResults.clear();
+    state.visibleResultLimit = 18;
+    state.renderToken = "";
+    pollJob(payload.job_id);
+  } catch (error) {
+    setRunState(error.message, true);
+  }
 }
 
-function filterCat(cat, el) {
-  F.cat = F.cat === cat ? null : cat;
-  document.querySelectorAll(".sidebar .sb-btn").forEach((btn) => btn.classList.remove("active"));
-  if (F.cat) el.classList.add("active");
-  else document.getElementById("nav-scanner").classList.add("active");
-  render();
+function pollJob(jobID) {
+  clearInterval(state.polling);
+  fetchJob(jobID);
+  state.polling = setInterval(() => fetchJob(jobID), 1200);
 }
 
-function toggleCtx(id) {
-  document.getElementById(id)?.classList.toggle("open");
+async function fetchJob(jobID) {
+  try {
+    const response = await fetch(`/api/jobs/${jobID}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "unable to load job");
+    }
+    state.job = payload;
+    renderJob();
+    renderResults();
+    if (payload.status === "completed") {
+      clearInterval(state.polling);
+      state.polling = null;
+      setRunState(`completed ${payload.completed}/${payload.total}`);
+    }
+  } catch (error) {
+    clearInterval(state.polling);
+    state.polling = null;
+    setRunState(error.message, true);
+  }
 }
 
-function copyText(value) {
-  navigator.clipboard.writeText(value).then(() => {
-    toast("Copied to clipboard.", "ok");
+function renderJob() {
+  if (!state.job) return;
+  const job = state.job;
+  const findings = job.results.reduce((sum, result) => sum + ((result.findings || []).length), 0);
+  const highRisk = job.results.filter((result) => ["critical", "high"].includes(result.summary && result.summary.risk_label)).length;
+  const progress = job.total ? Math.round((job.completed / job.total) * 100) : 0;
+
+  updateStat("sources", String(job.total));
+  updateStat("processed", String(job.completed));
+  updateStat("findings", String(findings));
+  updateStat("high risk", String(highRisk));
+  byId("progress-fill").style.width = `${progress}%`;
+
+  const statusEl = byId("job-status");
+  statusEl.textContent = job.status;
+  statusEl.className = `status-pill ${job.status}`;
+  byId("job-summary").textContent = `log> ${job.completed}/${job.total} javascript files processed, ${findings} findings collected`;
+}
+
+function renderResults() {
+  const root = byId("results");
+  if (!state.job || !root) return;
+
+  const completed = (state.job.results || []).filter((result) => result.status === "completed" || result.status === "failed");
+  const pendingCount = Math.max(0, (state.job.total || 0) - completed.length);
+  const sorted = completed.slice().sort(compareResults);
+  const renderable = sorted.filter((result) => shouldRenderResult(result));
+  const visible = renderable.slice(0, state.visibleResultLimit);
+  const hiddenResults = Math.max(0, renderable.length - visible.length);
+
+  const token = JSON.stringify({
+    status: state.job.status,
+    completed: state.job.completed,
+    total: state.job.total,
+    filters: state.filters,
+    visibleResultLimit: state.visibleResultLimit,
+    expanded: Array.from(state.expandedResults).sort(),
+    results: completed.map((result) => ({
+      id: result.id,
+      error: result.error,
+      status: result.status,
+      risk: result.summary && result.summary.risk_label,
+      findings: (result.findings || []).length,
+    })),
   });
+  if (token === state.renderToken) return;
+  state.renderToken = token;
+
+  const cards = visible.map((result) => renderResultCard(result)).join("");
+  const pending = pendingCount > 0 ? `<div class="pending-summary">${pendingCount} files are still being fetched or analyzed.</div>` : "";
+  const more = hiddenResults > 0 ? `<button class="more-results-btn" data-expand-results="true">Show ${hiddenResults} more files</button>` : "";
+  root.innerHTML = cards || pending || `<div class="empty-state"><div class="empty-title">No Matches</div><p>The current filters hide all findings or the analyzed JavaScript was clean.</p></div>`;
+  if (cards) {
+    root.insertAdjacentHTML("beforeend", `${pending}${more}`);
+  }
 }
 
-function exportJSON() {
-  if (!results.length) {
-    toast("No results to export yet.", "err");
+function shouldRenderResult(result) {
+  if (result.error) return true;
+  if (state.job && state.job.status !== "completed") return true;
+  return filterFindings(result.findings || []).length > 0;
+}
+
+function renderResultCard(result) {
+  const filtered = filterFindings(result.findings || []);
+  const findings = state.expandedResults.has(result.id) ? filtered : filtered.slice(0, 24);
+  const hiddenCount = filtered.length - findings.length;
+  if (state.job && state.job.status === "completed" && filtered.length === 0 && !result.error) return "";
+
+  return `
+    <article class="result-card">
+      <div class="result-head">
+        <div>
+          <div class="result-name">${escapeHtml(result.name || result.origin || "source")}</div>
+          <div class="result-origin">${escapeHtml(result.origin || result.kind || "")}</div>
+        </div>
+        <div class="risk-badge ${(result.summary && result.summary.risk_label) || "minimal"}">${(result.summary && result.summary.risk_label) || result.status}</div>
+      </div>
+      <div class="result-meta">
+        <span>${result.line_count || 0} lines</span>
+        <span>${(result.findings || []).length} findings</span>
+        <span>${filtered.length} visible</span>
+        <span>${(result.summary && result.summary.network_requests) || 0} requests</span>
+        <span>${(result.summary && result.summary.sensitive_params) || 0} sensitive params</span>
+      </div>
+      ${result.error ? `<div class="error-box">${escapeHtml(result.error)}</div>` : renderFindingList(result.id, findings, hiddenCount, result.status)}
+    </article>
+  `;
+}
+
+function renderFindingList(resultID, findings, hiddenCount, status) {
+  if (!findings.length) {
+    return `<div class="pending-box">${status === "completed" ? "No findings match the current filters." : "Waiting for analysis output..."}</div>`;
+  }
+
+  const rows = findings.map((finding) => `
+    <div class="finding ${finding.severity}">
+      <div class="finding-head">
+        <div>
+          <div class="finding-title">${escapeHtml(finding.title)}</div>
+          <div class="finding-sub">${escapeHtml(CATEGORY_LABELS[finding.category] || finding.category)} · line ${finding.line} · ${escapeHtml(finding.confidence)}</div>
+        </div>
+        <span class="sev-tag ${finding.severity}">${finding.severity}</span>
+      </div>
+      <div class="finding-value">${escapeHtml(finding.value || finding.context || "")}</div>
+      ${renderFindingContext(finding)}
+      ${finding.note ? `<div class="finding-note">${escapeHtml(finding.note)}</div>` : ""}
+      <details class="snippet">
+        <summary>Show Code</summary>
+        <pre>${escapeHtml(trimSnippet(finding.snippet || ""))}</pre>
+      </details>
+    </div>
+  `).join("");
+
+  if (hiddenCount <= 0) return rows;
+  return `${rows}<button class="more-btn" data-expand-result="${escapeHtml(resultID)}">Show ${hiddenCount} more findings</button>`;
+}
+
+function filterFindings(findings) {
+  return findings
+    .filter((finding) => {
+      if (!state.filters.includeLowSignal && !state.filters.query) {
+        if (finding.severity === "low" || finding.severity === "info") return false;
+      }
+      if (state.filters.category && finding.category !== state.filters.category) return false;
+      if (state.filters.severity && finding.severity !== state.filters.severity) return false;
+      if (!state.filters.query) return true;
+      const haystack = `${finding.title} ${finding.value} ${finding.context} ${finding.note || ""}`.toLowerCase();
+      return haystack.includes(state.filters.query);
+    })
+    .sort(compareFindings);
+}
+
+function compareResults(a, b) {
+  const riskOrder = { critical: 5, high: 4, medium: 3, low: 2, minimal: 1 };
+  const aRisk = riskOrder[(a.summary && a.summary.risk_label) || "minimal"] || 0;
+  const bRisk = riskOrder[(b.summary && b.summary.risk_label) || "minimal"] || 0;
+  if (aRisk !== bRisk) return bRisk - aRisk;
+  return ((b.findings || []).length - (a.findings || []).length);
+}
+
+function compareFindings(a, b) {
+  const severityOrder = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+  const aSeverity = severityOrder[a.severity] || 0;
+  const bSeverity = severityOrder[b.severity] || 0;
+  if (aSeverity !== bSeverity) return bSeverity - aSeverity;
+  if (a.confidence !== b.confidence) {
+    const confidenceOrder = { high: 3, medium: 2, low: 1 };
+    return (confidenceOrder[b.confidence] || 0) - (confidenceOrder[a.confidence] || 0);
+  }
+  return a.line - b.line;
+}
+
+function handleResultsClick(event) {
+  const expandResultsButton = event.target.closest("[data-expand-results]");
+  if (expandResultsButton) {
+    state.visibleResultLimit += 18;
+    renderResults();
     return;
   }
-
-  const blob = new Blob([JSON.stringify(results, null, 2)], { type: "application/json" });
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = `peelr-${new Date().toISOString().slice(0, 10)}.json`;
-  link.click();
-  toast("Exported as JSON.", "ok");
+  const expandButton = event.target.closest("[data-expand-result]");
+  if (!expandButton) return;
+  const id = expandButton.getAttribute("data-expand-result");
+  if (!id) return;
+  state.expandedResults.add(id);
+  renderResults();
 }
 
-function clearAll() {
-  results.length = 0;
-  document.getElementById("results-container").innerHTML = "";
-  document.getElementById("empty-state").style.display = "";
-  document.getElementById("filter-bar").style.display = "none";
-  document.getElementById("legend-bar").style.display = "none";
-  STATS.forEach((item) => $t(`s-${item.id}`, 0));
-  Object.keys(CATS).forEach((cat) => $t(`cnt-${cat}`, 0));
-  F.cat = null;
-  F.q = "";
-  F.sev = new Set(SEVERITY_FILTERS.map((item) => item.value));
-  document.getElementById("search-input").value = "";
-  document.querySelectorAll(".sev-chip").forEach((btn) => btn.classList.add("on"));
-  document.querySelectorAll(".sidebar .sb-btn").forEach((btn) => btn.classList.remove("active"));
-  document.getElementById("nav-scanner").classList.add("active");
+function updateStat(label, value) {
+  const node = document.querySelector(`[data-stat="${label}"]`);
+  if (node) node.textContent = value;
 }
 
-function setProgress(percent) {
-  document.getElementById("prog-fill").style.width = `${percent}%`;
-  document.getElementById("prog-wrap").classList.toggle("on", percent > 0 && percent < 100);
+function setRunState(text, isError) {
+  const meta = byId("run-meta");
+  if (!meta) return;
+  meta.textContent = text;
+  meta.classList.toggle("error", !!isError);
 }
 
-function setLoading(on, label = "") {
-  document.querySelectorAll(".btn").forEach((btn) => {
-    btn.disabled = on;
-  });
-  const text = document.getElementById("prog-text");
-  text.textContent = label;
-  text.classList.toggle("on", on);
-  if (on) setProgress(25);
-  else {
-    setProgress(100);
-    setTimeout(() => setProgress(0), 500);
-  }
+function byId(id) {
+  return document.getElementById(id);
 }
 
-function toast(msg, type = "info") {
-  const el = document.createElement("div");
-  el.className = `toast ${type}`;
-  el.textContent = msg;
-  document.getElementById("toasts").appendChild(el);
-  setTimeout(() => el.remove(), 3800);
-}
-
-function $t(id, value) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = value;
-}
-
-function x(value) {
+function escapeHtml(value) {
   return String(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -700,6 +501,17 @@ function x(value) {
     .replace(/'/g, "&#39;");
 }
 
-function attrEscape(value) {
-  return String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+function capitalize(value) {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function renderFindingContext(finding) {
+  if (!finding.context || finding.context === finding.value) return "";
+  return `<div class="finding-context">${escapeHtml(finding.context)}</div>`;
+}
+
+function trimSnippet(snippet) {
+  const lines = String(snippet).split("\n");
+  if (lines.length <= 18) return snippet;
+  return `${lines.slice(0, 18).join("\n")}\n...`;
 }

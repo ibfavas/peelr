@@ -2,16 +2,20 @@ package analyzer
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
-	"unicode"
 )
 
-const maxJSBytes = 15 << 20
+const MaxSourceBytes = 20 << 20
 
 type Severity string
 
@@ -23,7 +27,6 @@ const (
 	SevInfo     Severity = "info"
 )
 
-// Confidence describes how likely a finding is to be real.
 type Confidence string
 
 const (
@@ -32,203 +35,501 @@ const (
 	ConfLow    Confidence = "low"
 )
 
+type SourceKind string
+
+const (
+	SourceURL  SourceKind = "url"
+	SourceJS   SourceKind = "js"
+	SourceFile SourceKind = "file"
+)
+
+type SourceInput struct {
+	ID      string     `json:"id"`
+	Name    string     `json:"name"`
+	Kind    SourceKind `json:"kind"`
+	Origin  string     `json:"origin"`
+	Content string     `json:"content"`
+}
+
 type Finding struct {
+	ID         string     `json:"id"`
 	Category   string     `json:"category"`
 	Type       string     `json:"type"`
+	Title      string     `json:"title"`
 	Value      string     `json:"value"`
 	Line       int        `json:"line"`
+	Column     int        `json:"column"`
 	Context    string     `json:"context"`
+	Snippet    string     `json:"snippet"`
 	Severity   Severity   `json:"severity"`
 	Confidence Confidence `json:"confidence"`
 	Note       string     `json:"note,omitempty"`
 }
 
-type AnalysisResult struct {
-	URL         string         `json:"url"`
-	Timestamp   string         `json:"timestamp"`
-	FileSize    int            `json:"file_size"`
-	LineCount   int            `json:"line_count"`
-	RiskScore   int            `json:"risk_score"`
-	RiskLabel   string         `json:"risk_label"`
-	Findings    []Finding      `json:"findings"`
-	Summary     map[string]int `json:"summary"`
-	SevSummary  map[string]int `json:"sev_summary"`
-	ConfSummary map[string]int `json:"conf_summary"`
-	Error       string         `json:"error,omitempty"`
+type Summary struct {
+	TotalFindings      int            `json:"total_findings"`
+	ByCategory         map[string]int `json:"by_category"`
+	BySeverity         map[string]int `json:"by_severity"`
+	ByConfidence       map[string]int `json:"by_confidence"`
+	NetworkRequests    int            `json:"network_requests"`
+	SensitiveParams    int            `json:"sensitive_params"`
+	InterestingComment int            `json:"interesting_comments"`
+	RiskScore          int            `json:"risk_score"`
+	RiskLabel          string         `json:"risk_label"`
 }
 
-type pattern struct {
-	name       string
+type Result struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Kind        SourceKind `json:"kind"`
+	Origin      string     `json:"origin"`
+	Status      string     `json:"status"`
+	StartedAt   string     `json:"started_at"`
+	CompletedAt string     `json:"completed_at,omitempty"`
+	FileSize    int        `json:"file_size"`
+	LineCount   int        `json:"line_count"`
+	Summary     Summary    `json:"summary"`
+	Findings    []Finding  `json:"findings"`
+	Error       string     `json:"error,omitempty"`
+}
+
+type detector struct {
 	category   string
+	name       string
+	title      string
 	severity   Severity
 	confidence Confidence
 	note       string
 	re         *regexp.Regexp
 }
 
-var patterns []pattern
+type requestDetector struct {
+	name       string
+	title      string
+	re         *regexp.Regexp
+	confidence Confidence
+}
 
 var placeholderHints = []string{
 	"example", "sample", "test", "placeholder", "your_", "your-", "<your",
-	"EXAMPLE", "REPLACE", "INSERT", "CHANGEME", "xxxxxxxx", "00000000",
-	"1234567890", "abcdefgh", "dummy", "fake", "demo",
+	"replace", "changeme", "dummy", "demo", "fake", "localhost", "000000",
 }
 
-var commentPrefixes = []string{"//", "/*", "*", "#", "<!--"}
+var sensitiveParamNames = []string{
+	"token", "secret", "key", "password", "passwd", "pwd", "auth", "email", "session",
+}
 
-func init() {
-	raw := []struct {
-		name, category, re string
-		sev                Severity
-		conf               Confidence
-		note               string
-	}{
-		{"AWS Access Key", "api_keys", `AKIA[0-9A-Z]{16}`, SevCritical, ConfHigh,
-			"AWS access key ID. Verify it's not revoked before reporting."},
-		{"AWS Secret Key", "api_keys", `(?i)aws.{0,20}secret.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]`, SevCritical, ConfMedium,
-			"Likely AWS secret key. Validate the 40-char base64 value is real."},
-		{"Google API Key", "api_keys", `AIza[0-9A-Za-z\-_]{35}`, SevHigh, ConfHigh,
-			"Google API key. Check which APIs are enabled via key restriction."},
-		{"GitHub Token (PAT)", "api_keys", `ghp_[0-9a-zA-Z]{36}|github_pat_[0-9a-zA-Z_]{82}`, SevCritical, ConfHigh,
-			"GitHub personal access token. Scope determines blast radius."},
-		{"GitHub OAuth Token", "api_keys", `gho_[0-9a-zA-Z]{36}`, SevHigh, ConfHigh, ""},
-		{"Stripe Secret Key", "api_keys", `sk_live_[0-9a-zA-Z]{24,}`, SevCritical, ConfHigh,
-			"Live Stripe secret key. Full payment access."},
-		{"Stripe Publishable Key", "api_keys", `pk_live_[0-9a-zA-Z]{24,}`, SevMedium, ConfHigh,
-			"Stripe publishable key. Low risk alone but confirms Stripe usage."},
-		{"Slack Bot/App Token", "api_keys", `xox[baprs]-[0-9a-zA-Z\-]{10,}`, SevHigh, ConfHigh, ""},
-		{"Slack Webhook", "api_keys", `https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+`, SevHigh, ConfHigh,
-			"Can post messages to channel without auth."},
-		{"Firebase Realtime DB", "api_keys", `[a-z0-9-]+\.firebaseio\.com`, SevMedium, ConfMedium,
-			"Check if DB has open read/write rules."},
-		{"Firebase Cloud Msg Key", "api_keys", `AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}`, SevHigh, ConfHigh, ""},
-		{"JWT Token", "api_keys", `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`, SevHigh, ConfHigh,
-			"Decode at jwt.io. Check alg, exp, and claims."},
-		{"Twilio API Key", "api_keys", `SK[0-9a-fA-F]{32}`, SevHigh, ConfMedium,
-			"Could also be a Stripe idempotency key. Check context."},
-		{"SendGrid API Key", "api_keys", `SG\.[a-zA-Z0-9_-]{22,}\.[a-zA-Z0-9_-]{43,}`, SevHigh, ConfHigh, ""},
-		{"Mailchimp API Key", "api_keys", `[0-9a-f]{32}-us[0-9]{1,2}`, SevMedium, ConfMedium, ""},
-		{"Shopify Token", "api_keys", `shpat_[a-fA-F0-9]{32}|shpss_[a-fA-F0-9]{32}`, SevCritical, ConfHigh,
-			"Admin API access token. Full store access."},
-		{"PayPal Live Token", "api_keys", `access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}`, SevCritical, ConfHigh, ""},
-		{"Square Token", "api_keys", `sq0atp-[0-9A-Za-z\-_]{22}|sq0csp-[0-9A-Za-z\-_]{43}`, SevHigh, ConfHigh, ""},
-		{"Mapbox Token", "api_keys", `pk\.eyJ1IjoiW[A-Za-z0-9_-]{50,}`, SevMedium, ConfHigh, ""},
-		{"Generic API Key", "api_keys", `(?i)(?:api[_-]?key|apikey|api[_-]?secret)\s*[:=]\s*['\"][a-zA-Z0-9_\-]{16,}['\"]`, SevMedium, ConfLow,
-			"Generic pattern. High false positive rate — verify manually."},
-		{"Generic Secret", "api_keys", `(?i)(?:secret|token|password|passwd|pwd)\s*[:=]\s*['\"][^'"]{8,}['\"]`, SevMedium, ConfLow,
-			"Generic pattern. Could be a config placeholder."},
+var lineDetectors = mustDetectors([]detector{
+	{category: "api_keys", name: "aws_access_key", title: "AWS Access Key", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`AKIA[0-9A-Z]{16}`)},
+	{category: "api_keys", name: "aws_secret_key", title: "AWS Secret Key", severity: SevCritical, confidence: ConfMedium, note: "Verify the 40-character value before treating as valid.", re: regexp.MustCompile(`(?i)aws.{0,20}secret.{0,20}['"][0-9a-zA-Z/+]{40}['"]`)},
+	{category: "api_keys", name: "google_api_key", title: "Google API Key", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`AIza[0-9A-Za-z\-_]{35}`)},
+	{category: "api_keys", name: "github_pat", title: "GitHub Token", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`ghp_[0-9a-zA-Z]{36}|github_pat_[0-9a-zA-Z_]{82}`)},
+	{category: "api_keys", name: "stripe_secret", title: "Stripe Secret Key", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`sk_live_[0-9a-zA-Z]{16,}`)},
+	{category: "api_keys", name: "stripe_public", title: "Stripe Publishable Key", severity: SevMedium, confidence: ConfHigh, re: regexp.MustCompile(`pk_live_[0-9a-zA-Z]{16,}`)},
+	{category: "api_keys", name: "paypal_token", title: "PayPal Production Token", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}`)},
+	{category: "api_keys", name: "slack_token", title: "Slack Token", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`xox[baprs]-[0-9a-zA-Z\-]{10,}`)},
+	{category: "api_keys", name: "slack_webhook", title: "Slack Webhook", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+`)},
+	{category: "api_keys", name: "firebase", title: "Firebase Reference", severity: SevMedium, confidence: ConfMedium, re: regexp.MustCompile(`[a-z0-9-]+\.firebaseio\.com`)},
+	{category: "api_keys", name: "firebase_msg", title: "Firebase Messaging Key", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{80,}`)},
+	{category: "api_keys", name: "jwt", title: "JWT Token", severity: SevHigh, confidence: ConfHigh, note: "Decode to inspect algorithm, expiry, and claims.", re: regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`)},
+	{category: "api_keys", name: "sendgrid", title: "SendGrid API Key", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`SG\.[a-zA-Z0-9_-]{22,}\.[a-zA-Z0-9_-]{43,}`)},
+	{category: "api_keys", name: "generic_key", title: "Generic API Key", severity: SevMedium, confidence: ConfLow, note: "Generic key pattern. Validate manually.", re: regexp.MustCompile(`(?i)(?:api[_-]?key|apikey|client[_-]?secret|access[_-]?token)\s*[:=]\s*['"][^'"]{12,}['"]`)},
 
-		{"Hardcoded Password", "credentials", `(?i)(?:password|passwd|pwd)\s*[=:]\s*['"][^'"]{6,}['"]`, SevHigh, ConfLow,
-			"Check if this value is actually used vs just a label."},
-		{"Basic Auth Header", "credentials", `Authorization:\s*Basic\s+[A-Za-z0-9+/=]{20,}`, SevHigh, ConfHigh,
-			"Base64-decode to recover credentials."},
-		{"Bearer Token", "credentials", `Authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*`, SevMedium, ConfMedium, ""},
-		{"DB Connection String", "credentials", `(?i)(?:mongodb|mysql|postgres|redis|mssql):\/\/[^'">\s]{10,}`, SevCritical, ConfHigh,
-			"Full DB connection string. May contain credentials."},
-		{"Private Key Block", "credentials", `-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----`, SevCritical, ConfHigh,
-			"Private key material in JS source."},
+	{category: "credentials", name: "password", title: "Hardcoded Password", severity: SevHigh, confidence: ConfLow, re: regexp.MustCompile(`(?i)(?:password|passwd|pwd)\s*[:=]\s*['"][^'"]{6,}['"]`)},
+	{category: "credentials", name: "username", title: "Hardcoded Username", severity: SevLow, confidence: ConfLow, re: regexp.MustCompile(`(?i)(?:username|user|login)\s*[:=]\s*['"][^'"]{3,}['"]`)},
+	{category: "credentials", name: "basic_auth", title: "Basic Auth Header", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`Authorization:\s*Basic\s+[A-Za-z0-9+/=]{12,}`)},
+	{category: "credentials", name: "bearer", title: "Bearer Token", severity: SevMedium, confidence: ConfMedium, re: regexp.MustCompile(`Authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*`)},
+	{category: "credentials", name: "db_conn", title: "Database Connection String", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`(?i)(?:mongodb|mysql|postgres|postgresql|redis|amqp|mssql):\/\/[^'">\s]{10,}`)},
+	{category: "credentials", name: "private_key", title: "Private Key Block", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----`)},
 
-		{"Email Address", "emails", `[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`, SevInfo, ConfMedium, ""},
+	{category: "emails", name: "email", title: "Email Address", severity: SevInfo, confidence: ConfMedium, re: regexp.MustCompile(`\b[a-zA-Z0-9._%+\-]{1,64}@[a-zA-Z0-9.\-]{1,253}\.[a-zA-Z]{2,24}\b`)},
 
-		{"innerHTML assignment", "xss", `\.innerHTML\s*[+]?=\s*(?!['"]<)`, SevHigh, ConfMedium,
-			"Sink exists. Verify what content reaches it."},
-		{"outerHTML assignment", "xss", `\.outerHTML\s*[+]?=`, SevHigh, ConfMedium, ""},
-		{"document.write()", "xss", `document\.write\s*\(`, SevHigh, ConfMedium, ""},
-		{"document.writeln()", "xss", `document\.writeln\s*\(`, SevHigh, ConfMedium, ""},
-		{"eval() call", "xss", `\beval\s*\(`, SevHigh, ConfMedium,
-			"eval exists. Verify whether attacker-controlled input can reach it."},
-		{"setTimeout string arg", "xss", `setTimeout\s*\(\s*['"]`, SevMedium, ConfHigh,
-			"String literal passed to setTimeout — eval equivalent."},
-		{"setInterval string arg", "xss", `setInterval\s*\(\s*['"]`, SevMedium, ConfHigh, ""},
-		{"dangerouslySetInnerHTML", "xss", `dangerouslySetInnerHTML\s*=\s*\{`, SevHigh, ConfMedium,
-			"React explicit bypass. Check what __html receives."},
-		{"jQuery .html() sink", "xss", `\$\([^)]+\)\.html\s*\(`, SevHigh, ConfMedium, ""},
-		{"insertAdjacentHTML", "xss", `\.insertAdjacentHTML\s*\(`, SevHigh, ConfMedium, ""},
-		{"location.href assignment", "xss", `location\.href\s*=`, SevMedium, ConfLow,
-			"Open redirect or XSS depending on scheme. Check source."},
-		{"window.location assign", "xss", `window\.location\s*=`, SevMedium, ConfLow, ""},
-		{"Function() constructor", "xss", `new\s+Function\s*\(`, SevHigh, ConfMedium,
-			"Equivalent to eval. Check argument source."},
+	{category: "xss", name: "innerhtml", title: "innerHTML Assignment", severity: SevHigh, confidence: ConfMedium, note: "Check whether user-controlled input reaches the sink.", re: regexp.MustCompile(`\.innerHTML\s*[+]?=`)},
+	{category: "xss", name: "outerhtml", title: "outerHTML Assignment", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\.outerHTML\s*[+]?=`)},
+	{category: "xss", name: "document_write", title: "document.write Usage", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`document\.write(?:ln)?\s*\(`)},
+	{category: "xss", name: "eval", title: "eval() Usage", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\beval\s*\(`)},
+	{category: "xss", name: "function_ctor", title: "Function Constructor", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`new\s+Function\s*\(`)},
+	{category: "xss", name: "dangerously_set_inner_html", title: "React dangerouslySetInnerHTML", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`dangerouslySetInnerHTML\s*=\s*\{`)},
+	{category: "xss", name: "jquery_html", title: "jQuery html() Injection Point", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\$\([^)]+\)\.(?:html|append|prepend|before|after)\s*\(`)},
+	{category: "xss", name: "insert_adjacent_html", title: "insertAdjacentHTML Usage", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\.insertAdjacentHTML\s*\(`)},
+	{category: "xss", name: "srcdoc", title: "srcdoc Assignment", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\.srcdoc\s*=`)},
 
-		{"document.domain write", "dom_sinks", `document\.domain\s*=`, SevHigh, ConfHigh,
-			"document.domain relaxation. Same-origin policy weakening."},
-		{"postMessage sink", "dom_sinks", `\.postMessage\s*\(`, SevMedium, ConfLow,
-			"Check if origin validation exists on the receiver side."},
-		{"srcdoc attribute", "dom_sinks", `\.srcdoc\s*=`, SevHigh, ConfMedium, ""},
-		{"WebSocket dynamic URL", "dom_sinks", `new\s+WebSocket\s*\(\s*[^'"]*\+`, SevMedium, ConfMedium,
-			"Dynamic WebSocket URL. Check if attacker-controlled."},
-		{"script.src assignment", "dom_sinks", `\.src\s*=\s*(?!['"])`, SevHigh, ConfMedium,
-			"Dynamic script load. If user-controlled this is script injection."},
-		{"open() with concat", "dom_sinks", `window\.open\s*\([^)]*\+`, SevMedium, ConfMedium, ""},
-		{"location.hash read", "dom_sinks", `location\.hash`, SevLow, ConfLow,
-			"Hash-based source. Only interesting if passed to a sink."},
-		{"URLSearchParams(location)", "dom_sinks", `new URLSearchParams\(location`, SevLow, ConfMedium, ""},
+	{category: "paths", name: "unix_path", title: "Unix Path", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?:^|['"\s])((?:/[\w.\-]+){2,})`)},
+	{category: "paths", name: "relative_path", title: "Relative Path", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?:\.{1,2}/[\w./\-]+\.(?:js|json|map|html|txt|env|graphql))`)},
+	{category: "paths", name: "windows_path", title: "Windows Path", severity: SevInfo, confidence: ConfMedium, re: regexp.MustCompile(`[A-Za-z]:\\(?:[^<>:"/\\|?*\r\n]+\\)*[^<>:"/\\|?*\r\n]*`)},
+	{category: "paths", name: "s3", title: "S3 Reference", severity: SevMedium, confidence: ConfHigh, re: regexp.MustCompile(`s3://[a-zA-Z0-9.\-_/]+|[a-zA-Z0-9\-]+\.s3(?:\.[a-z0-9\-]+)?\.amazonaws\.com`)},
+})
 
-		{"__proto__ bracket write", "prototype_pollution", `\.__proto__\s*\[`, SevHigh, ConfHigh,
-			"Direct prototype write. If user-controlled this is confirmed pollution."},
-		{"constructor.prototype write", "prototype_pollution", `\.constructor\.prototype`, SevHigh, ConfMedium, ""},
-		{"Object.assign with req body", "prototype_pollution", `Object\.assign\s*\([^,]+,\s*(?:req\.|body\.|params\.)`, SevHigh, ConfHigh,
-			"User-controlled object merged at top level. Classic pollution vector."},
-		{"merge/extend with taint", "prototype_pollution", `(?i)(?:merge|extend|deepmerge|deepextend)\s*\([^,]+,\s*(?:req\.|body\.|params\.|JSON\.parse)`, SevHigh, ConfHigh,
-			"Deep merge with user-supplied data. High confidence pollution gadget."},
-		{"lodash _.merge taint", "prototype_pollution", `_\.merge\s*\([^,]+,\s*(?:req\.|body\.|params\.)`, SevHigh, ConfHigh,
-			"Lodash merge with req data. Lodash <4.17.5 is directly exploitable."},
-		{"bracket notation taint", "prototype_pollution", `\w+\[(?:req|body|params|query)[\.\[]\w+\]\s*=`, SevMedium, ConfMedium, ""},
+var commentDetectors = mustDetectors([]detector{
+	{category: "comments", name: "todo", title: "TODO Comment", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?i)\bTODO\b`)},
+	{category: "comments", name: "fixme", title: "FIXME Comment", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?i)\bFIXME\b`)},
+	{category: "comments", name: "hack", title: "HACK Comment", severity: SevLow, confidence: ConfLow, re: regexp.MustCompile(`(?i)\bHACK\b`)},
+	{category: "comments", name: "security", title: "Security Comment", severity: SevMedium, confidence: ConfLow, note: "Comment references a sensitive topic. Review surrounding code.", re: regexp.MustCompile(`(?i)\b(security|vuln|bypass|insecure|workaround|token|secret|password|credential)\b`)},
+})
 
-		{"fetch() call", "endpoints", `fetch\s*\(\s*['"]([^'"]+)['"]`, SevInfo, ConfHigh, ""},
-		{"axios call", "endpoints", `axios\.[a-z]+\s*\(\s*['"]([^'"]+)['"]`, SevInfo, ConfHigh, ""},
-		{"XMLHttpRequest open", "endpoints", `\.open\s*\(\s*['"][A-Z]+['"]\s*,\s*['"]([^'"]+)['"]`, SevInfo, ConfHigh, ""},
-		{"jQuery AJAX call", "endpoints", `\$\.(?:ajax|get|post)\s*\(\s*['"]([^'"]+)['"]`, SevInfo, ConfHigh, ""},
-		{"API path literal", "endpoints", `/api/v?[0-9]*/[a-zA-Z0-9/_\-?=&.]{3,}`, SevInfo, ConfMedium, ""},
-		{"Full URL literal", "endpoints", `https?://[a-zA-Z0-9.\-_/?=&#%@+:]{10,}`, SevInfo, ConfMedium, ""},
+var requestDetectors = []requestDetector{
+	{name: "fetch", title: "fetch() Request", re: regexp.MustCompile(`fetch\s*\(\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
+	{name: "axios", title: "axios Request", re: regexp.MustCompile(`axios(?:\.[a-z]+)?\s*\(\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
+	{name: "xhr", title: "XMLHttpRequest open()", re: regexp.MustCompile(`\.open\s*\(\s*['"][A-Z]+['"]\s*,\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
+	{name: "jquery_ajax", title: "jQuery AJAX Call", re: regexp.MustCompile(`\$\.(?:ajax|get|post)\s*\(\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
+}
 
-		{"GraphQL endpoint", "graphql", `/graphql(?:[/?#]|$)`, SevInfo, ConfHigh, ""},
-		{"GraphQL operation", "graphql", `(?i)(?:query|mutation|subscription)\s+\w+\s*\{`, SevInfo, ConfHigh,
-			"Reveals operation names and structure."},
-		{"GraphQL introspection field", "graphql", `__schema|__type|__typename`, SevMedium, ConfMedium,
-			"If introspection is enabled on prod this is a full schema leak."},
-		{"Apollo client init", "graphql", `(?i)apolloclient|ApolloClient|createApolloClient`, SevInfo, ConfHigh, ""},
-		{"gql template tag", "graphql", `gql\s*` + "`", SevInfo, ConfHigh, ""},
+var genericEndpointRe = regexp.MustCompile(`https?://[a-zA-Z0-9.\-_/?=&#%@+:]{8,}|/[a-zA-Z0-9._\-/]+(?:\?[a-zA-Z0-9=&_%\-@.:]+)?`)
+var queryParamRe = regexp.MustCompile(`[?&]([a-zA-Z0-9_.\-]{1,64})=`)
+var functionDeclRe = regexp.MustCompile(`function(?:\s+[A-Za-z0-9_$]+)?\s*\(([^)]{1,200})\)`)
+var arrowDeclRe = regexp.MustCompile(`(?:const|let|var)?\s*[A-Za-z0-9_$]*\s*=\s*\(([^)]{1,200})\)\s*=>`)
+var userInputRe = regexp.MustCompile(`location\.(?:hash|search|href)|document\.(?:URL|cookie|referrer)|window\.name|URLSearchParams|event\.data|req\.(?:body|query|params)`)
 
-		{"Unix file path", "paths", `(?:^|['"])((?:/[a-zA-Z0-9._\-]+){2,})`, SevInfo, ConfLow,
-			"May reveal server-side directory structure."},
-		{"Windows file path", "paths", `[A-Za-z]:\\(?:[^<>:"/\\|?*\r\n]+\\)*[^<>:"/\\|?*\r\n]*`, SevInfo, ConfMedium, ""},
-		{"S3 bucket reference", "paths", `s3://[a-zA-Z0-9.\-_/]+|[a-zA-Z0-9\-]+\.s3(?:\.[a-z0-9\-]+)?\.amazonaws\.com`, SevMedium, ConfHigh,
-			"Check bucket ACL. May be publicly readable or writable."},
+func mustDetectors(items []detector) []detector {
+	return items
+}
 
-		{"TODO comment", "comments", `//\s*TODO[:\s]`, SevInfo, ConfLow, ""},
-		{"FIXME comment", "comments", `//\s*FIXME[:\s]`, SevInfo, ConfLow, ""},
-		{"HACK comment", "comments", `//\s*HACK[:\s]`, SevLow, ConfLow, ""},
-		{"Security-related comment", "comments", `(?i)//.*(?:security|vuln|hack|bypass|workaround|insecure)`, SevLow, ConfLow, ""},
-		{"Danger comment", "comments", `(?i)//.*(?:broken|don.t use|dangerous|legacy|deprecated)`, SevLow, ConfLow, ""},
-		{"Credential comment", "comments", `(?i)//.*(?:password|secret|key|token|credential)`, SevMedium, ConfLow,
-			"Comment references creds — check surrounding code."},
+func LoadURL(raw string) (SourceInput, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return SourceInput{}, fmt.Errorf("empty URL")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return SourceInput{}, fmt.Errorf("invalid URL: %s", raw)
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(raw)
+	if err != nil {
+		return SourceInput{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return SourceInput{}, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if resp.ContentLength > MaxSourceBytes {
+		return SourceInput{}, fmt.Errorf("file exceeds %d MB limit", MaxSourceBytes>>20)
+	}
+	limited := io.LimitReader(resp.Body, MaxSourceBytes+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return SourceInput{}, err
+	}
+	if len(body) > MaxSourceBytes {
+		return SourceInput{}, fmt.Errorf("file exceeds %d MB limit", MaxSourceBytes>>20)
+	}
+	return SourceInput{
+		ID:      SourceKey(SourceURL, raw),
+		Name:    filepath.Base(parsed.Path),
+		Kind:    SourceURL,
+		Origin:  raw,
+		Content: string(body),
+	}, nil
+}
+
+func Analyze(input SourceInput) Result {
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	result := Result{
+		ID:        sourceID(input),
+		Name:      fallbackName(input),
+		Kind:      input.Kind,
+		Origin:    input.Origin,
+		Status:    "completed",
+		StartedAt: startedAt,
+		FileSize:  len(input.Content),
+		Summary: Summary{
+			ByCategory:   map[string]int{},
+			BySeverity:   map[string]int{},
+			ByConfidence: map[string]int{},
+		},
 	}
 
-	for _, r := range raw {
-		re, err := regexp.Compile(r.re)
-		if err != nil {
+	content := strings.ReplaceAll(input.Content, "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+	result.LineCount = len(lines)
+	dedup := map[string]bool{}
+
+	for i, line := range lines {
+		lineNo := i + 1
+		trimmed := strings.TrimSpace(line)
+		context := trimContext(trimmed)
+
+		for _, d := range lineDetectors {
+			matches := d.re.FindAllStringIndex(line, -1)
+			for _, loc := range matches {
+				value := strings.TrimSpace(line[loc[0]:loc[1]])
+				if d.category == "emails" && !isStrictEmailMatch(line, loc[0], loc[1], value) {
+					continue
+				}
+				conf, note := adjustConfidence(d.confidence, value, trimmed)
+				sev := d.severity
+				if d.category == "xss" && userInputRe.MatchString(line) {
+					conf = ConfHigh
+					if sev == SevMedium {
+						sev = SevHigh
+					}
+					note = appendNote(note, "User-controlled input appears on the same line.")
+				}
+				addFinding(&result, dedup, Finding{
+					Category:   d.category,
+					Type:       d.name,
+					Title:      d.title,
+					Value:      normalizeValue(value),
+					Line:       lineNo,
+					Column:     loc[0] + 1,
+					Context:    context,
+					Snippet:    makeSnippet(lines, lineNo),
+					Severity:   sev,
+					Confidence: conf,
+					Note:       appendNote(note, d.note),
+				})
+			}
+		}
+
+		if isCommentLine(trimmed) {
+			for _, d := range commentDetectors {
+				if d.re.MatchString(trimmed) {
+					addFinding(&result, dedup, Finding{
+						Category:   d.category,
+						Type:       d.name,
+						Title:      d.title,
+						Value:      context,
+						Line:       lineNo,
+						Column:     1,
+						Context:    context,
+						Snippet:    makeSnippet(lines, lineNo),
+						Severity:   d.severity,
+						Confidence: d.confidence,
+						Note:       d.note,
+					})
+				}
+			}
+		}
+
+		for _, req := range requestDetectors {
+			matches := req.re.FindAllStringSubmatchIndex(line, -1)
+			for _, loc := range matches {
+				if len(loc) < 4 {
+					continue
+				}
+				value := line[loc[2]:loc[3]]
+				addFinding(&result, dedup, Finding{
+					Category:   "endpoints",
+					Type:       req.name,
+					Title:      req.title,
+					Value:      value,
+					Line:       lineNo,
+					Column:     loc[2] + 1,
+					Context:    context,
+					Snippet:    makeSnippet(lines, lineNo),
+					Severity:   SevInfo,
+					Confidence: req.confidence,
+				})
+			}
+		}
+
+		endpoints := genericEndpointRe.FindAllStringIndex(line, -1)
+		if !isCommentLine(trimmed) {
+			for _, loc := range endpoints {
+				value := strings.Trim(line[loc[0]:loc[1]], `"' )];,`)
+				if !looksLikeEndpoint(value) {
+					continue
+				}
+				addFinding(&result, dedup, Finding{
+					Category:   "endpoints",
+					Type:       "endpoint_literal",
+					Title:      "Endpoint Literal",
+					Value:      value,
+					Line:       lineNo,
+					Column:     loc[0] + 1,
+					Context:    context,
+					Snippet:    makeSnippet(lines, lineNo),
+					Severity:   SevInfo,
+					Confidence: ConfMedium,
+				})
+			}
+		}
+
+		extractQueryParams(&result, dedup, lines, lineNo, line, context)
+		extractFunctionParams(&result, dedup, lines, lineNo, line, context)
+	}
+
+	sort.Slice(result.Findings, func(i, j int) bool {
+		if result.Findings[i].Line == result.Findings[j].Line {
+			if result.Findings[i].Category == result.Findings[j].Category {
+				return result.Findings[i].Column < result.Findings[j].Column
+			}
+			return result.Findings[i].Category < result.Findings[j].Category
+		}
+		return result.Findings[i].Line < result.Findings[j].Line
+	})
+
+	result.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+	result.Summary.TotalFindings = len(result.Findings)
+	result.Summary.RiskScore, result.Summary.RiskLabel = computeRisk(result.Findings)
+	return result
+}
+
+func extractQueryParams(result *Result, dedup map[string]bool, lines []string, lineNo int, line, context string) {
+	matches := queryParamRe.FindAllStringSubmatchIndex(line, -1)
+	for _, loc := range matches {
+		if len(loc) < 4 {
 			continue
 		}
-		patterns = append(patterns, pattern{r.name, r.category, r.sev, r.conf, r.note, re})
+		name := line[loc[2]:loc[3]]
+		severity := SevInfo
+		confidence := ConfMedium
+		title := "URL Query Parameter"
+		note := ""
+		if isSensitiveParam(name) {
+			severity = SevMedium
+			confidence = ConfHigh
+			title = "Sensitive Query Parameter"
+			note = "Sensitive parameter name detected."
+		}
+		addFinding(result, dedup, Finding{
+			Category:   "parameters",
+			Type:       "query_parameter",
+			Title:      title,
+			Value:      name,
+			Line:       lineNo,
+			Column:     loc[2] + 1,
+			Context:    context,
+			Snippet:    makeSnippet(lines, lineNo),
+			Severity:   severity,
+			Confidence: confidence,
+			Note:       note,
+		})
 	}
 }
 
-type dedup struct{ seen map[string]bool }
-
-func newDedup() *dedup { return &dedup{seen: map[string]bool{}} }
-func (d *dedup) add(key string) bool {
-	if d.seen[key] {
-		return false
+func extractFunctionParams(result *Result, dedup map[string]bool, lines []string, lineNo int, line, context string) {
+	paramLists := [][]string{}
+	for _, re := range []*regexp.Regexp{functionDeclRe, arrowDeclRe} {
+		matches := re.FindAllStringSubmatch(line, -1)
+		for _, match := range matches {
+			if len(match) < 2 {
+				continue
+			}
+			paramLists = append(paramLists, strings.Split(match[1], ","))
+		}
 	}
-	d.seen[key] = true
-	return true
+	for _, params := range paramLists {
+		for _, raw := range params {
+			name := strings.TrimSpace(raw)
+			if name == "" {
+				continue
+			}
+			severity := SevInfo
+			confidence := ConfMedium
+			title := "Function Parameter"
+			note := ""
+			if isSensitiveParam(name) {
+				severity = SevMedium
+				confidence = ConfHigh
+				title = "Sensitive Function Parameter"
+				note = "Sensitive parameter name detected."
+			}
+			column := strings.Index(line, name)
+			if column < 0 {
+				column = 0
+			}
+			addFinding(result, dedup, Finding{
+				Category:   "parameters",
+				Type:       "function_parameter",
+				Title:      title,
+				Value:      name,
+				Line:       lineNo,
+				Column:     column + 1,
+				Context:    context,
+				Snippet:    makeSnippet(lines, lineNo),
+				Severity:   severity,
+				Confidence: confidence,
+				Note:       note,
+			})
+		}
+	}
 }
 
-func isPlaceholder(val string) bool {
-	lower := strings.ToLower(val)
+func addFinding(result *Result, dedup map[string]bool, finding Finding) {
+	key := strings.Join([]string{finding.Category, finding.Type, finding.Value, fmt.Sprint(finding.Line)}, ":")
+	if dedup[key] {
+		return
+	}
+	dedup[key] = true
+	finding.ID = stableID(key)
+	result.Findings = append(result.Findings, finding)
+	result.Summary.ByCategory[finding.Category]++
+	result.Summary.BySeverity[string(finding.Severity)]++
+	result.Summary.ByConfidence[string(finding.Confidence)]++
+	if finding.Category == "endpoints" {
+		result.Summary.NetworkRequests++
+	}
+	if finding.Category == "parameters" && strings.Contains(strings.ToLower(finding.Title), "sensitive") {
+		result.Summary.SensitiveParams++
+	}
+	if finding.Category == "comments" {
+		result.Summary.InterestingComment++
+	}
+}
+
+func computeRisk(findings []Finding) (int, string) {
+	sevWeight := map[Severity]float64{
+		SevCritical: 28,
+		SevHigh:     12,
+		SevMedium:   4,
+		SevLow:      1,
+		SevInfo:     0.25,
+	}
+	confWeight := map[Confidence]float64{
+		ConfHigh:   1.0,
+		ConfMedium: 0.65,
+		ConfLow:    0.35,
+	}
+	raw := 0.0
+	for _, finding := range findings {
+		raw += sevWeight[finding.Severity] * confWeight[finding.Confidence]
+	}
+	score := int(100.0 * (1.0 - expApprox(-raw/90.0)))
+	switch {
+	case score >= 80:
+		return score, "critical"
+	case score >= 55:
+		return score, "high"
+	case score >= 28:
+		return score, "medium"
+	case score >= 10:
+		return score, "low"
+	default:
+		return score, "minimal"
+	}
+}
+
+func expApprox(x float64) float64 {
+	if x < -10 {
+		return 0
+	}
+	total := 1.0
+	term := 1.0
+	for i := 1; i <= 18; i++ {
+		term *= x / float64(i)
+		total += term
+	}
+	return total
+}
+
+func adjustConfidence(base Confidence, value, line string) (Confidence, string) {
+	if isPlaceholder(value) {
+		return ConfLow, "Value looks like a placeholder or example."
+	}
+	if isCommentLine(strings.TrimSpace(line)) && base == ConfHigh {
+		return ConfMedium, "Value appears inside a comment."
+	}
+	if isCommentLine(strings.TrimSpace(line)) && base == ConfMedium {
+		return ConfLow, "Value appears inside a comment."
+	}
+	return base, ""
+}
+
+func isPlaceholder(value string) bool {
+	lower := strings.ToLower(value)
 	for _, hint := range placeholderHints {
-		if strings.Contains(lower, strings.ToLower(hint)) {
+		if strings.Contains(lower, hint) {
 			return true
 		}
 	}
@@ -236,212 +537,168 @@ func isPlaceholder(val string) bool {
 }
 
 func isCommentLine(line string) bool {
-	t := strings.TrimSpace(line)
-	for _, p := range commentPrefixes {
-		if strings.HasPrefix(t, p) {
+	return strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") || strings.HasPrefix(line, "#")
+}
+
+func trimContext(line string) string {
+	line = strings.TrimSpace(line)
+	if len(line) > 220 {
+		return line[:220] + "..."
+	}
+	return line
+}
+
+func makeSnippet(lines []string, lineNo int) string {
+	start := lineNo - 2
+	if start < 1 {
+		start = 1
+	}
+	end := lineNo + 2
+	if end > len(lines) {
+		end = len(lines)
+	}
+	var b strings.Builder
+	for i := start; i <= end; i++ {
+		b.WriteString(fmt.Sprintf("%4d | %s", i, lines[i-1]))
+		if i < end {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func looksLikeEndpoint(value string) bool {
+	if value == "" || value == "/" || value == "//" || strings.HasPrefix(value, "//") {
+		return false
+	}
+	if strings.HasPrefix(value, "/") {
+		return strings.Count(value, "/") >= 1
+	}
+	return strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://")
+}
+
+func isSensitiveParam(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	for _, item := range sensitiveParamNames {
+		if strings.Contains(lower, item) {
 			return true
 		}
 	}
 	return false
 }
 
-func downgradeConf(c Confidence) Confidence {
-	switch c {
-	case ConfHigh:
-		return ConfMedium
-	case ConfMedium:
-		return ConfLow
-	default:
-		return ConfLow
+func normalizeValue(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, `"'`)
+	if len(value) > 160 {
+		return value[:160] + "..."
 	}
+	return value
 }
 
-func scoreConfidence(base Confidence, val, line string) (Confidence, string) {
-	conf := base
-	note := ""
-	if isPlaceholder(val) {
-		conf = ConfLow
-		note = "Value looks like a placeholder/example — verify manually."
-	} else if isCommentLine(line) && conf > ConfLow {
-		conf = downgradeConf(conf)
-		note = "Found in a comment — lower confidence."
-	}
-	return conf, note
-}
-
-var sevWeight = map[Severity]float64{
-	SevCritical: 40, SevHigh: 15, SevMedium: 5, SevLow: 1, SevInfo: 0,
-}
-var confMult = map[Confidence]float64{
-	ConfHigh: 1.0, ConfMedium: 0.6, ConfLow: 0.3,
-}
-
-func computeRisk(findings []Finding, flowCount int) (int, string) {
-	raw := 0.0
-	for _, f := range findings {
-		raw += sevWeight[f.Severity] * confMult[f.Confidence]
-	}
-	// Flows add extra weight because they confirm a real path to a sink.
-	bonus := float64(flowCount) * 20.0
-	if bonus > 40 {
-		bonus = 40
-	}
-	raw += bonus
-	score := int(100.0 * (1.0 - expApprox(-raw/120.0)))
-	label := riskLabel(score)
-	return score, label
-}
-
-// expApprox keeps the scorer self-contained.
-func expApprox(x float64) float64 {
-	return mathExp(x)
-}
-
-var mathExpFn func(float64) float64
-
-func mathExp(x float64) float64 {
-	// A short series is accurate enough for this score curve.
-	if x < -10 {
-		return 0.0
-	}
-	result := 1.0
-	term := 1.0
-	for i := 1; i <= 20; i++ {
-		term *= x / float64(i)
-		result += term
-	}
-	return result
-}
-
-func riskLabel(score int) string {
-	switch {
-	case score >= 80:
-		return "critical"
-	case score >= 55:
-		return "high"
-	case score >= 30:
-		return "medium"
-	case score >= 10:
-		return "low"
-	default:
-		return "minimal"
-	}
-}
-
-func fetchContent(url string) (string, error) {
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	if resp.ContentLength > maxJSBytes {
-		return "", fmt.Errorf("file exceeds %d MB limit", maxJSBytes>>20)
-	}
-	lr := io.LimitReader(resp.Body, maxJSBytes+1)
-	b, err := io.ReadAll(lr)
-	if err != nil {
-		return "", err
-	}
-	if len(b) > maxJSBytes {
-		return "", fmt.Errorf("file exceeds %d MB limit", maxJSBytes>>20)
-	}
-	return string(b), err
-}
-
-// AnalyzeContent scans already-loaded JavaScript.
-func AnalyzeContent(source, content string, flowCount int) AnalysisResult {
-	result := AnalysisResult{
-		URL:         source,
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
-		Summary:     map[string]int{},
-		SevSummary:  map[string]int{},
-		ConfSummary: map[string]int{},
-		FileSize:    len(content),
-	}
-
-	dd := newDedup()
-	scanner := bufio.NewScanner(strings.NewReader(content))
-	scanner.Buffer(make([]byte, 1024*1024), maxJSBytes+1)
-	lineNum := 0
-
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Text()
-
-		for _, p := range patterns {
-			matches := p.re.FindAllString(line, -1)
-			for _, m := range matches {
-				m = strings.TrimSpace(m)
-				if m == "" || len(m) < 4 || !isPrintable(m) {
-					continue
-				}
-				key := p.category + ":" + p.name + ":" + m
-				if !dd.add(key) {
-					continue
-				}
-				ctx := strings.TrimSpace(line)
-				if len(ctx) > 200 {
-					ctx = ctx[:200] + "…"
-				}
-				conf, autoNote := scoreConfidence(p.confidence, m, line)
-				note := p.note
-				if autoNote != "" {
-					if note != "" {
-						note = autoNote + " " + note
-					} else {
-						note = autoNote
-					}
-				}
-				result.Findings = append(result.Findings, Finding{
-					Category:   p.category,
-					Type:       p.name,
-					Value:      m,
-					Line:       lineNum,
-					Context:    ctx,
-					Severity:   p.severity,
-					Confidence: conf,
-					Note:       note,
-				})
-				result.Summary[p.category]++
-				result.SevSummary[string(p.severity)]++
-				result.ConfSummary[string(conf)]++
-			}
+func appendNote(parts ...string) string {
+	var kept []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			kept = append(kept, part)
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		result.Error = fmt.Sprintf("scan failed: %v", err)
-		return result
-	}
-	result.LineCount = lineNum
-	result.RiskScore, result.RiskLabel = computeRisk(result.Findings, flowCount)
-	return result
+	return strings.Join(kept, " ")
 }
 
-// Analyze fetches a URL and runs the content scanner.
-func Analyze(url string) (AnalysisResult, string) {
-	content, err := fetchContent(url)
-	if err != nil {
-		return AnalysisResult{
-			URL:         url,
-			Timestamp:   time.Now().UTC().Format(time.RFC3339),
-			Summary:     map[string]int{},
-			SevSummary:  map[string]int{},
-			ConfSummary: map[string]int{},
-			Error:       err.Error(),
-		}, ""
+func isStrictEmailMatch(line string, start, end int, value string) bool {
+	if strings.Count(value, "@") != 1 {
+		return false
 	}
-	return AnalyzeContent(url, content, 0), content
-}
-
-func isPrintable(s string) bool {
-	for _, r := range s {
-		if r > unicode.MaxASCII && !unicode.IsPrint(r) {
+	localDomain := strings.Split(value, "@")
+	if len(localDomain) != 2 || localDomain[0] == "" || localDomain[1] == "" {
+		return false
+	}
+	if strings.Contains(localDomain[1], "..") || strings.HasPrefix(localDomain[1], ".") || strings.HasSuffix(localDomain[1], ".") {
+		return false
+	}
+	if start > 0 {
+		prev := line[start-1]
+		if prev == '/' || prev == ':' || prev == '@' {
 			return false
 		}
 	}
+	if end < len(line) {
+		next := line[end]
+		if next == '/' || next == ':' || next == '@' {
+			return false
+		}
+	}
+	tokenStart := start
+	for tokenStart > 0 && !isDelimiter(line[tokenStart-1]) {
+		tokenStart--
+	}
+	tokenEnd := end
+	for tokenEnd < len(line) && !isDelimiter(line[tokenEnd]) {
+		tokenEnd++
+	}
+	token := line[tokenStart:tokenEnd]
+	if strings.Contains(token, "://") || strings.Contains(token, "/@") || strings.Contains(token, "@/") {
+		return false
+	}
 	return true
+}
+
+func isDelimiter(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', '"', '\'', '`', '(', ')', '[', ']', '{', '}', ',', ';', '<', '>', '=':
+		return true
+	default:
+		return false
+	}
+}
+
+func sourceID(input SourceInput) string {
+	if input.ID != "" {
+		return input.ID
+	}
+	if input.Origin != "" {
+		return SourceKey(input.Kind, input.Origin)
+	}
+	return SourceKey(input.Kind, input.Name)
+}
+
+func fallbackName(input SourceInput) string {
+	if input.Name != "" {
+		return input.Name
+	}
+	if input.Origin != "" {
+		return input.Origin
+	}
+	return "source.js"
+}
+
+func stableID(value string) string {
+	sum := sha1.Sum([]byte(value))
+	return hex.EncodeToString(sum[:8])
+}
+
+func SourceKey(kind SourceKind, value string) string {
+	return stableID(kind.String() + ":" + value)
+}
+
+func ReadURLs(r io.Reader) ([]string, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	seen := map[string]bool{}
+	var items []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || seen[line] {
+			continue
+		}
+		seen[line] = true
+		items = append(items, line)
+	}
+	return items, scanner.Err()
+}
+
+func (s SourceKind) String() string {
+	return string(s)
 }

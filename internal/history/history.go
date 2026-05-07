@@ -6,71 +6,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/ibfavas/peelr/internal/analyzer"
 )
 
-func dir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	d := filepath.Join(home, ".peelr", "history")
-	return d, os.MkdirAll(d, 0700)
-}
-
-func keyFor(url string) string {
-	h := sha256.Sum256([]byte(url))
-	return fmt.Sprintf("%x", h[:8])
-}
-
 type Record struct {
-	URL       string             `json:"url"`
+	SourceID  string             `json:"source_id"`
+	Name      string             `json:"name"`
+	Origin    string             `json:"origin"`
 	ScannedAt string             `json:"scanned_at"`
 	Findings  []analyzer.Finding `json:"findings"`
 }
 
-func Save(result analyzer.AnalysisResult) error {
-	d, err := dir()
-	if err != nil {
-		return err
-	}
-	rec := Record{
-		URL:       result.URL,
-		ScannedAt: time.Now().UTC().Format(time.RFC3339),
-		Findings:  result.Findings,
-	}
-	data, err := json.MarshalIndent(rec, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(d, keyFor(result.URL)+".json")
-	return os.WriteFile(path, data, 0600)
-}
-
-func Load(url string) (*Record, error) {
-	d, err := dir()
-	if err != nil {
-		return nil, err
-	}
-	path := filepath.Join(d, keyFor(url)+".json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var rec Record
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return nil, err
-	}
-	return &rec, nil
-}
-
 type DiffResult struct {
-	URL          string             `json:"url"`
+	SourceID     string             `json:"source_id"`
 	PreviousScan string             `json:"previous_scan"`
 	CurrentScan  string             `json:"current_scan"`
 	New          []analyzer.Finding `json:"new"`
@@ -79,90 +30,141 @@ type DiffResult struct {
 	IsFirstScan  bool               `json:"is_first_scan"`
 }
 
-func fingerprintFinding(f analyzer.Finding) string {
-	return f.Category + ":" + f.Type + ":" + f.Value
+func dir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(home, ".peelr", "history")
+	return path, os.MkdirAll(path, 0o700)
 }
 
-// Diff compares the current result with the saved baseline.
-func Diff(result analyzer.AnalysisResult) (DiffResult, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	dr := DiffResult{
-		URL:         result.URL,
-		CurrentScan: now,
-	}
-	if result.Error != "" {
-		return dr, fmt.Errorf("cannot diff failed scan: %s", result.Error)
-	}
-
-	prev, err := Load(result.URL)
-	if err != nil {
-		return dr, err
-	}
-
-	if prev == nil {
-		dr.IsFirstScan = true
-		dr.New = result.Findings
-		return dr, Save(result)
-	}
-
-	dr.PreviousScan = prev.ScannedAt
-
-	prevSet := map[string]analyzer.Finding{}
-	for _, f := range prev.Findings {
-		prevSet[fingerprintFinding(f)] = f
-	}
-	currSet := map[string]analyzer.Finding{}
-	for _, f := range result.Findings {
-		currSet[fingerprintFinding(f)] = f
-	}
-
-	for key, f := range currSet {
-		if _, exists := prevSet[key]; !exists {
-			dr.New = append(dr.New, f)
-		} else {
-			dr.Unchanged++
-		}
-	}
-	for key, f := range prevSet {
-		if _, exists := currSet[key]; !exists {
-			dr.Gone = append(dr.Gone, f)
-		}
-	}
-
-	return dr, Save(result)
+func keyFor(sourceID string) string {
+	sum := sha256.Sum256([]byte(sourceID))
+	return fmt.Sprintf("%x", sum[:8])
 }
 
-func ListHistory() ([]Record, error) {
-	d, err := dir()
-	if err != nil {
-		return nil, err
+func Save(result analyzer.Result) error {
+	if result.Error != "" || result.ID == "" {
+		return nil
 	}
-	entries, err := os.ReadDir(d)
-	if err != nil {
-		return nil, err
-	}
-	var records []Record
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) != ".json" {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(d, e.Name()))
-		if err != nil {
-			continue
-		}
-		var rec Record
-		if err := json.Unmarshal(data, &rec); err != nil {
-			continue
-		}
-		records = append(records, rec)
-	}
-	return records, nil
-}
-
-func ClearHistory() error {
-	d, err := dir()
+	path, err := dir()
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(d)
+	record := Record{
+		SourceID:  result.ID,
+		Name:      result.Name,
+		Origin:    result.Origin,
+		ScannedAt: time.Now().UTC().Format(time.RFC3339),
+		Findings:  result.Findings,
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(path, keyFor(result.ID)+".json"), data, 0o600)
+}
+
+func Load(sourceID string) (*Record, error) {
+	path, err := dir()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(path, keyFor(sourceID)+".json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var record Record
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil, err
+	}
+	return &record, nil
+}
+
+func Diff(result analyzer.Result) (DiffResult, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	out := DiffResult{
+		SourceID:    result.ID,
+		CurrentScan: now,
+	}
+	if result.Error != "" {
+		return out, fmt.Errorf("cannot diff failed scan: %s", result.Error)
+	}
+	prev, err := Load(result.ID)
+	if err != nil {
+		return out, err
+	}
+	if prev == nil {
+		out.IsFirstScan = true
+		out.New = result.Findings
+		return out, Save(result)
+	}
+	out.PreviousScan = prev.ScannedAt
+	prevSet := map[string]analyzer.Finding{}
+	for _, finding := range prev.Findings {
+		prevSet[fingerprint(finding)] = finding
+	}
+	currSet := map[string]analyzer.Finding{}
+	for _, finding := range result.Findings {
+		currSet[fingerprint(finding)] = finding
+	}
+	for key, finding := range currSet {
+		if _, ok := prevSet[key]; ok {
+			out.Unchanged++
+			continue
+		}
+		out.New = append(out.New, finding)
+	}
+	for key, finding := range prevSet {
+		if _, ok := currSet[key]; !ok {
+			out.Gone = append(out.Gone, finding)
+		}
+	}
+	sort.Slice(out.New, func(i, j int) bool { return out.New[i].Line < out.New[j].Line })
+	sort.Slice(out.Gone, func(i, j int) bool { return out.Gone[i].Line < out.Gone[j].Line })
+	return out, Save(result)
+}
+
+func ListHistory() ([]Record, error) {
+	path, err := dir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []Record
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(path, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var record Record
+		if err := json.Unmarshal(data, &record); err != nil {
+			continue
+		}
+		out = append(out, record)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ScannedAt > out[j].ScannedAt })
+	return out, nil
+}
+
+func ClearHistory() error {
+	path, err := dir()
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(path)
+}
+
+func fingerprint(f analyzer.Finding) string {
+	return fmt.Sprintf("%s:%s:%s:%d", f.Category, f.Type, f.Value, f.Line)
 }
