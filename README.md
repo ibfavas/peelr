@@ -1,4 +1,4 @@
-# Peelr
+# 🧅 Peelr
 
 **Peelr is a JavaScript URL analysis and triage tool for security research.**
 
