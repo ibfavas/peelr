@@ -270,7 +270,7 @@ You can:
 ./peelr --url https://target.com/app.js --format plain
 ```
 
-## Example CLI Output
+## 🧪 Example CLI Output
 
 The repository includes a local sample file at [sample-test.js](sample-test.js).
 
@@ -313,7 +313,7 @@ This sample demonstrates that Peelr can surface multiple categories in one pass:
 - paths
 - XSS sinks
 
-## History and Diffing
+## 🕘 History and Diffing
 
 Peelr stores scan history in:
 
@@ -339,7 +339,7 @@ Peelr stores scan history in:
 ./peelr --clear-history
 ```
 
-## HTTP API
+## 🔌 HTTP API
 
 Peelr uses a job-based API for the web UI.
 
@@ -374,15 +374,15 @@ curl http://127.0.0.1:8080/api/jobs/JOB_ID
 curl http://127.0.0.1:8080/api/history
 ```
 
-## Technical Details
+## 🔧 Technical Details
 
-### Architecture
+### 🏗️ Architecture
 
 - Backend: Go with the standard library
 - Frontend: vanilla JavaScript, HTML, and CSS
 - Analysis engine: pattern-based JavaScript inspection with noise reduction and result scoring
 
-### Server-Side Processing
+### 🖥️ Server-Side Processing
 
 All analysis is performed server-side for:
 
@@ -391,7 +391,7 @@ All analysis is performed server-side for:
 - safer handling of large JavaScript files
 - easier history and diff support
 
-### Current Limits
+### 📏 Current Limits
 
 | Limit | Value |
 |---|---|
@@ -399,7 +399,7 @@ All analysis is performed server-side for:
 | Maximum JavaScript URLs per web job | `250` |
 | URL fetch timeout | `20s` |
 
-## Risk Scoring
+## 📊 Risk Scoring
 
 Each analyzed JavaScript file gets a `0-100` risk score and a label.
 
@@ -417,7 +417,7 @@ Risk is based on:
 - finding confidence
 - finding volume
 
-## Confidence Levels
+## 🎯 Confidence Levels
 
 | Confidence | Meaning |
 |---|---|
@@ -425,7 +425,7 @@ Risk is based on:
 | `medium` | useful signal that still needs manual validation |
 | `low` | broad heuristic or context with higher noise potential |
 
-## Performance Notes
+## ⚡ Performance Notes
 
 To keep the web UI responsive on noisy scans, Peelr:
 
@@ -444,7 +444,7 @@ If you are working with very large URL lists, prefer:
 - using JSON output for automation
 - enabling lower-signal findings only after the higher-signal pass
 
-## Use Cases
+## 🎯 Use Cases
 
 - Bug Bounty Hunting: find exposed API keys, credentials, and risky sinks quickly
 - Security Audits: identify vulnerable client-side patterns in JavaScript-heavy applications
@@ -452,7 +452,7 @@ If you are working with very large URL lists, prefer:
 - Asset Discovery: map API endpoints, routes, and path references
 - Penetration Testing: surface likely attack vectors for manual validation
 
-## What Peelr Is and Isn't
+## ⚖️ What Peelr Is and Isn't
 
 | Peelr does | Peelr does not |
 |---|---|
@@ -462,7 +462,7 @@ If you are working with very large URL lists, prefer:
 | Preserve code context for fast review | Replace manual validation |
 | Prioritize high-signal findings | Eliminate all false positives |
 
-## Contributing
+## 🤝 Contributing
 
 Contributions are welcome.
 
@@ -474,7 +474,7 @@ Typical workflow:
 4. Run `go build ./...`.
 5. Open a pull request.
 
-## Safety and Ethics
+## 🛡️ Safety and Ethics
 
 Use Peelr only on systems you own or have explicit written permission to test.
 
@@ -487,6 +487,6 @@ This tool is intended for:
 
 Unauthorized access to computer systems is illegal.
 
-## License
+## 📝 License
 
 See [MIT LICENSE](LICENSE).
