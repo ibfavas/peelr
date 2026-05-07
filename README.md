@@ -33,9 +33,9 @@ Peelr is built for that workflow. It is intentionally focused:
 
 It is meant for the moment where you already have `.js` URLs and want fast answers about what deserves attention first.
 
-## Security Detection
+## 🔍 Security Detection
 
-### API Keys
+### 🔑 API Keys
 
 Peelr detects:
 
@@ -50,7 +50,7 @@ Peelr detects:
 - SendGrid keys
 - generic API key and access token patterns
 
-### Credentials
+### 🔐 Credentials
 
 Peelr looks for:
 
@@ -61,11 +61,11 @@ Peelr looks for:
 - database connection strings
 - private key blocks
 
-### Email Addresses
+### 📧 Email Addresses
 
 Peelr extracts email addresses found in JavaScript code and applies stricter validation so strings that are really URL fragments with `@` do not get treated as normal email findings.
 
-### XSS Vulnerabilities
+### ⚠️ XSS Vulnerabilities
 
 Peelr identifies client-side patterns that commonly lead to Cross-Site Scripting issues, including:
 
@@ -79,11 +79,11 @@ Peelr identifies client-side patterns that commonly lead to Cross-Site Scripting
 - React `dangerouslySetInnerHTML`
 - jQuery HTML injection points
 
-### XSS Functions
+### 🧪 XSS Functions
 
 Peelr also flags function patterns and DOM usage that may become XSS sinks depending on how data reaches them. The output is meant to help you prioritize manual review, not claim exploitability automatically.
 
-## API & Endpoint Discovery
+## 🌐 API & Endpoint Discovery
 
 Peelr extracts:
 
@@ -95,7 +95,7 @@ Peelr extracts:
 - base paths and versioned routes
 - network request hints across the file
 
-## Parameter Analysis
+## 📋 Parameter Analysis
 
 Peelr finds:
 
@@ -103,7 +103,7 @@ Peelr finds:
 - function parameters
 - sensitive parameters such as `token`, `key`, `secret`, `password`, and related names
 
-## Path & Directory Discovery
+## 📁 Path & Directory Discovery
 
 Peelr extracts:
 
@@ -112,14 +112,14 @@ Peelr extracts:
 - filesystem-like references
 - embedded file and route references
 
-## Code Analysis
+## 💬 Code Analysis
 
 Peelr highlights:
 
 - interesting comments like `TODO`, `FIXME`, `SECURITY`, `HACK`, `BUG`, and `WARNING`
 - suspicious comments containing sensitive or security-relevant language
 
-## Advanced Features
+## 🚀 Advanced Features
 
 - Multiple File Analysis: analyze one or many JavaScript URLs in a single run
 - Local JavaScript Analysis: analyze `.js` files directly without fetching them from the network
@@ -130,13 +130,13 @@ Peelr highlights:
 - Modern UI: dark terminal-style interface optimized for large result sets
 - Reduced False Positives: noise controls and stricter matching to reduce junk findings
 
-## Screenshots
+## 🖼️ Screenshots
 
 ![Peelr input view](assets/peelr-web-input.png)
 
 ![Peelr results view](assets/peelr-web-console.png)
 
-## Installation
+## 🛠️ Installation
 
 Requirement: `Go 1.21+`
 
@@ -170,7 +170,7 @@ go build -o peelr ./cmd/peelr
 
 Peelr uses the Go standard library only.
 
-## Usage
+## 📖 Usage
 
 ### Run the Web UI
 
@@ -224,7 +224,7 @@ https://static.example.com/runtime.js
 cat js_urls.txt | ./peelr
 ```
 
-## Web UI Guide
+## 🖥️ Web UI Guide
 
 The web UI is focused on direct JavaScript URL analysis only.
 
@@ -250,7 +250,7 @@ You can:
 6. Use category and severity filters to narrow the result set.
 7. Open `Show Code` on findings that need direct inspection.
 
-## CLI Output Formats
+## 📤 CLI Output Formats
 
 ### Table
 
