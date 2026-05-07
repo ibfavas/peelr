@@ -489,4 +489,4 @@ Unauthorized access to computer systems is illegal.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+See [MIT LICENSE](LICENSE).
