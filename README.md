@@ -4,7 +4,17 @@
 
 You give Peelr direct JavaScript URLs or local JavaScript files. It fetches or reads the source, analyzes the code, and highlights the findings worth reviewing first.
 
-Current release: `2.0.0`
+Current release: `3.0.0`
+
+## 🆕 What's New in 3.0
+
+- **Rebuilt detection engine** — detectors now run against real string literals instead of raw regex lines, which kills the biggest false-positive classes (DOM sinks inside strings, `keyboard` matching `key`, division operators read as paths).
+- **Confidence you can act on** — placeholder values (`AKIAIOSFODNN7EXAMPLE`), dummy passwords, template-interpolated values, and example domains are downgraded or dropped instead of reported as secrets.
+- **Only sensitive function parameters** — `function login(user, token)` no longer reports every parameter; only sensitive-named ones.
+- **Redesigned web UI** — a scan → prioritize → inspect → export workflow with a stats dashboard, category tabs with counts, severity filter, search, finding dismissal, pagination, and JSON/CSV export.
+- **Performance** — minified bundles are scanned in chunks with quote-parity-safe literal extraction (a 3.3 MB single-line bundle analyzes in ~2.3 s), findings are capped per category (400) and overall (3000), and the UI paginates and virtualizes large result sets.
+- **CLI** — new `-min-severity` filter; severity-sorted table/plain output.
+- **Server** — `GET /api/jobs/{id}/export?format=csv|json`, accepts any `http(s)` URL (no more silent drops of URLs without `.js`), browser-like User-Agent on fetch, in-memory job store is bounded.
 
 [![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen?style=flat)](#installation)
@@ -125,10 +135,10 @@ Peelr highlights:
 - Local JavaScript Analysis: analyze `.js` files directly without fetching them from the network
 - File Upload: upload a text file with multiple JavaScript URLs in the web UI
 - Live Results: view results as they are processed
-- Code Context: inspect matching code through `Show Code`
-- Filterable Results: filter by category, severity, and search text
-- Modern UI: dark terminal-style interface optimized for large result sets
-- Reduced False Positives: noise controls and stricter matching to reduce junk findings
+- Triage Dashboard: stats strip, category tabs with counts, severity filter, and search
+- Dismiss & Export: dismiss false positives, restore them later, export JSON/CSV
+- Scan History: revisit previous CLI and web scans from the UI
+- Reduced False Positives: literal-scoped detection, whole-token sensitive-name matching, and placeholder/dummy-value filtering
 
 ## 🖼️ Screenshots
 
@@ -226,29 +236,30 @@ cat js_urls.txt | ./peelr
 
 ## 🖥️ Web UI Guide
 
-The web UI is focused on direct JavaScript URL analysis only.
+The web UI is focused on direct JavaScript URL analysis.
 
 You can:
 
-- paste one or more JavaScript URLs
+- paste one or more JavaScript URLs (any `http(s)` URL — they don't need to end in `.js`)
 - upload a text file containing JavaScript URLs
-- run an analysis job
-- monitor progress live while files are processed
-- filter results by category
-- filter results by severity
-- search across titles, values, notes, and context
-- opt into lower-signal findings only when needed
-- expand more files and more findings on demand
+- run an analysis job and monitor progress live while files are processed
+- review the stats dashboard: files, findings, secrets, critical/high counts, top risk
+- switch category tabs (All, Secrets, XSS & sinks, Endpoints, Parameters, Paths, Emails, Comments) with live counts
+- filter by severity (all severities shown by default)
+- search across titles, values, and notes
+- expand a finding for its context line, code snippet, and analyst note
+- dismiss false positives (and restore them later)
+- export the job as JSON or CSV
+- open scan history to inspect previous CLI and web scans
 
 ### Web UI Workflow
 
 1. Start Peelr with `./peelr`.
 2. Open `http://127.0.0.1:8080`.
 3. Paste JavaScript URLs or upload a list file.
-4. Click `Run Analysis`.
-5. Review the stats, runtime progress, and grouped findings.
-6. Use category and severity filters to narrow the result set.
-7. Open `Show Code` on findings that need direct inspection.
+4. Click `Scan` and watch the progress bar and per-file status.
+5. Triage from the dashboard: start with the Secrets tab and Critical/High severities.
+6. Expand findings for context, dismiss noise, export what matters.
 
 ## 📤 CLI Output Formats
 
@@ -270,6 +281,14 @@ You can:
 ./peelr --url https://target.com/app.js --format plain
 ```
 
+### Filter by minimum severity (table/plain)
+
+```bash
+./peelr --url https://target.com/app.js --min-severity high
+```
+
+Accepted values: `critical`, `high`, `medium`, `low`, `info`.
+
 ## 🧪 Example CLI Output
 
 The repository includes a local sample file at [sample-test.js](sample-test.js).
@@ -280,38 +299,35 @@ Run it with:
 ./peelr --js-file ./sample-test.js
 ```
 
-Example output:
+Example output (Peelr 3.0):
 
 ```text
 sample-test.js
-23 lines  14 findings  risk MEDIUM [29/100]
+23 lines  11 findings  risk MEDIUM [41/100]
 SEVERITY  CONFIDENCE  CATEGORY     TYPE                       LINE  VALUE
-info      low         comments     TODO Comment               1     // TODO: remove before production
-medium    low         comments     Security Comment           2     // SECURITY: test fixture for Peelr CLI validation
-info      low         emails       Email Address              4     security@example.com
-medium    low         api_keys     Generic API Key            5     apiKey = "AIzaSyD3MO-TEST-KEY-1234567890abcd
-high      low         credentials  Hardcoded Password         7     Password = "super-secret-password
-info      medium      parameters   Function Parameter         9     name
-info      medium      parameters   Function Parameter         9     markup
-info      low         emails       Email Address              10    security@example.com
-info      medium      endpoints    Endpoint Literal           10    /api/v1/profile?email=security@example.com&token=demo-token
-medium    high        parameters   Sensitive Query Parameter  10    email
-medium    high        parameters   Sensitive Query Parameter  10    token
-info      low         paths        Unix Path                  10    /api/v1/profile
+high      high        api_keys     JWT Token                  6     eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoidGVzdCJ9.signature
+high      medium      credentials  Hardcoded Password         7     super-secret-password
 high      medium      xss          innerHTML Assignment       18    .innerHTML =
 high      medium      xss          document.write Usage       19    document.write(
+medium    high        parameters   Sensitive Query Parameter  10    email
+medium    high        parameters   Sensitive Query Parameter  10    token
+medium    medium      credentials  Hardcoded Secret           6     eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoidGVzdCJ9.signature
+medium    low         comments     Security Comment           2     // SECURITY: test fixture for Peelr CLI validation
+medium    low         credentials  Hardcoded Secret           5     AKIAIOSFODNN7EXAMPLE
+info      medium      endpoints    Endpoint Literal           10    /api/v1/profile?email=security@example.com&token=demo-token
+info      low         comments     TODO Comment               1     // TODO: remove before production
 ```
 
 This sample demonstrates that Peelr can surface multiple categories in one pass:
 
-- comments
-- email addresses
-- API keys
+- API keys and JWTs
 - credentials
-- endpoints
-- sensitive parameters
-- paths
 - XSS sinks
+- sensitive query parameters (only sensitive names — not every parameter)
+- endpoints
+- security-relevant comments
+
+Note what it does *not* report: the placeholder AWS key is downgraded, the example-domain email is skipped, and non-sensitive function parameters are ignored.
 
 ## 🕘 History and Diffing
 
@@ -374,13 +390,25 @@ curl http://127.0.0.1:8080/api/jobs/JOB_ID
 curl http://127.0.0.1:8080/api/history
 ```
 
+### Export a job's findings
+
+```bash
+curl "http://127.0.0.1:8080/api/jobs/JOB_ID/export?format=csv" -o findings.csv
+curl "http://127.0.0.1:8080/api/jobs/JOB_ID/export?format=json" -o findings.json
+```
+
+The export is a flat list of findings with `file` and `origin` columns attached.
+
 ## 🔧 Technical Details
 
 ### 🏗️ Architecture
 
 - Backend: Go with the standard library
 - Frontend: vanilla JavaScript, HTML, and CSS
-- Analysis engine: pattern-based JavaScript inspection with noise reduction and result scoring
+- Analysis engine: literal-scoped JavaScript inspection — detectors run against
+  extracted string literals (for secrets, endpoints, emails, paths) or against
+  code with literals blanked (for DOM sinks and function parameters), with
+  whole-token sensitive-name matching and placeholder/dummy-value filtering
 
 ### 🖥️ Server-Side Processing
 
@@ -398,6 +426,8 @@ All analysis is performed server-side for:
 | Maximum fetched source size | `20 MB` |
 | Maximum JavaScript URLs per web job | `250` |
 | URL fetch timeout | `20s` |
+| Findings kept per category | `400` (rest counted in `summary.truncated`) |
+| Findings kept per file | `3000` |
 
 ## 📊 Risk Scoring
 
@@ -427,22 +457,15 @@ Risk is based on:
 
 ## ⚡ Performance Notes
 
-To keep the web UI responsive on noisy scans, Peelr:
+Peelr 3.0 is built to stay fast on minified bundles and noisy scans:
 
-- hides low and info findings by default
-- sorts results by risk and finding density
-- renders a limited number of result files at first
-- renders only the first visible findings per file at first
-- expands more files and more findings on demand
-- trims long code snippets in the default pass
-- debounces text search
-- avoids unnecessary rerender churn when job state has not materially changed
+- long lines are scanned in overlapping chunks, but string literals are extracted once per line so chunk boundaries can't corrupt quote state
+- findings are capped at 400 per category and 3000 per file; the dropped counts are reported in `summary.truncated`
+- findings are sorted severity/confidence-first so the important ones surface immediately
+- the web UI paginates findings (60 per file), collapses file groups, expands findings in place without re-rendering, and debounces search
+- the CLI skips blocking on stdin when nothing is piped in
 
-If you are working with very large URL lists, prefer:
-
-- splitting very large batches into smaller runs
-- using JSON output for automation
-- enabling lower-signal findings only after the higher-signal pass
+Measured on a 3.3 MB single-line minified bundle (60,000 string literals): ~2.3 s end to end, with exact kept/truncated accounting.
 
 ## 🎯 Use Cases
 

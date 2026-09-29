@@ -3,14 +3,106 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Peelr 2.0.0</title>
+<title>Peelr 3.0 — JS recon &amp; triage</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/app.css?v=2.0.0">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css?v=3.0.0">
 </head>
 <body>
-<div id="app"></div>
-<script src="/static/app.js?v=2.0.0"></script>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">◉</span>
+      <span class="brand-name">Peelr</span>
+      <span class="brand-ver">3.0</span>
+    </div>
+    <div class="topbar-sub">JS recon &amp; triage for bug bounty</div>
+    <div class="topbar-actions">
+      <button id="history-btn" class="btn ghost" type="button">History</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- New scan -->
+  <section class="card" id="scan-card">
+    <h2>New scan</h2>
+    <p class="muted">Paste direct JavaScript URLs, one per line. Peelr fetches each file and flags secrets, sinks, endpoints and more.</p>
+    <textarea id="urls" rows="5" spellcheck="false" placeholder="https://target.com/static/app.js&#10;https://target.com/assets/main.js"></textarea>
+    <div class="row gap">
+      <label class="btn ghost file-label" for="file">Upload list</label>
+      <input type="file" id="file" accept=".txt,.csv,.list" hidden>
+      <span id="file-name" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="clear" class="btn ghost" type="button">Clear</button>
+      <button id="scan" class="btn primary" type="button">Scan</button>
+    </div>
+    <div id="scan-error" class="error hidden"></div>
+  </section>
+
+  <!-- Progress -->
+  <section class="card hidden" id="progress-card">
+    <div class="row between">
+      <h2>Scan in progress</h2>
+      <span id="job-status" class="pill">queued</span>
+    </div>
+    <div class="progress"><div id="bar"></div></div>
+    <div id="progress-text" class="muted small"></div>
+    <div id="file-status" class="file-status"></div>
+  </section>
+
+  <!-- Results -->
+  <section id="results-section" class="hidden">
+    <div class="stats" id="stats"></div>
+
+    <div class="card toolbar">
+      <div class="tabs" id="cat-tabs" role="tablist"></div>
+      <div class="row gap wrap">
+        <select id="sev-filter" aria-label="Severity filter">
+          <option value="all">All severities</option>
+          <option value="critical">Critical only</option>
+          <option value="high">High and up</option>
+          <option value="medium">Medium and up</option>
+        </select>
+        <input id="search" type="search" placeholder="Search title, value, file…" aria-label="Search findings">
+        <span class="spacer"></span>
+        <button id="export-json" class="btn ghost small-btn" type="button">Export JSON</button>
+        <button id="export-csv" class="btn ghost small-btn" type="button">Export CSV</button>
+      </div>
+      <div class="row gap wrap hidden" id="dismiss-bar">
+        <span class="muted small" id="dismiss-count"></span>
+        <button id="toggle-dismissed" class="btn ghost small-btn" type="button">Show dismissed</button>
+        <button id="restore-dismissed" class="btn ghost small-btn" type="button">Restore all</button>
+      </div>
+    </div>
+
+    <div id="files"></div>
+    <div id="no-match" class="card hidden">
+      <p class="muted">No findings match the current filters.</p>
+    </div>
+  </section>
+
+  <!-- History drawer -->
+  <div id="history-overlay" class="overlay hidden">
+    <aside class="drawer">
+      <div class="row between">
+        <h2>Scan history</h2>
+        <button id="history-close" class="btn ghost" type="button">Close</button>
+      </div>
+      <p class="muted small">Previous CLI and web scans stored on this machine. Select one to inspect it.</p>
+      <div id="history-list"></div>
+    </aside>
+  </div>
+
+</main>
+
+<footer class="wrap footer">
+  <span class="muted small">Peelr 3.0 · findings are triage leads, not confirmed vulnerabilities — verify before reporting.</span>
+</footer>
+
+<script src="/static/app.js?v=3.0.0"></script>
 </body>
 </html>

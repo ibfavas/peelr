@@ -10,13 +10,14 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/ibfavas/peelr/internal/analyzer"
 	"github.com/ibfavas/peelr/internal/history"
 	"github.com/ibfavas/peelr/internal/server"
 )
 
-const version = "2.0.0"
+const version = "3.0.0"
 
 const banner = `
     ____            __
@@ -39,12 +40,21 @@ func main() {
 	clearHistoryFlag := flag.Bool("clear-history", false, "Delete saved history")
 	workersFlag := flag.Int("workers", 4, "Concurrent workers for URL mode")
 	silentFlag := flag.Bool("silent", false, "Suppress banner and progress")
+	minSevFlag := flag.String("min-severity", "", "Only show findings at or above: critical|high|medium|low|info")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
 	if *versionFlag {
 		fmt.Println("peelr v" + version)
 		return
+	}
+	if *minSevFlag != "" {
+		switch analyzer.Severity(strings.ToLower(*minSevFlag)) {
+		case analyzer.SevCritical, analyzer.SevHigh, analyzer.SevMedium, analyzer.SevLow, analyzer.SevInfo:
+		default:
+			fmt.Fprintf(os.Stderr, "error: invalid -min-severity %q: want critical|high|medium|low|info\n", *minSevFlag)
+			os.Exit(2)
+		}
 	}
 	if *clearHistoryFlag {
 		exitIf(history.ClearHistory())
@@ -83,9 +93,9 @@ func main() {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(results)
 	case "plain":
-		printPlain(results)
+		printPlain(results, *minSevFlag)
 	default:
-		printTable(results)
+		printTable(results, *minSevFlag)
 	}
 	for _, result := range results {
 		if result.Error != "" {
@@ -174,17 +184,22 @@ func analyzeFiles(paths []string, silent bool) []analyzer.Result {
 	return results
 }
 
-func printTable(results []analyzer.Result) {
+func printTable(results []analyzer.Result, minSev string) {
 	for _, result := range results {
 		fmt.Printf("\n%s\n", result.Name)
 		if result.Error != "" {
 			fmt.Printf("error: %s\n", result.Error)
 			continue
 		}
-		fmt.Printf("%d lines  %d findings  risk %s [%d/100]\n", result.LineCount, len(result.Findings), strings.ToUpper(result.Summary.RiskLabel), result.Summary.RiskScore)
+		findings := filterByMinSeverity(result.Findings, minSev)
+		fmt.Printf("%d lines  %d findings", result.LineCount, len(findings))
+		if minSev != "" && len(findings) != len(result.Findings) {
+			fmt.Printf(" (%d total)", len(result.Findings))
+		}
+		fmt.Printf("  risk %s [%d/100]\n", strings.ToUpper(result.Summary.RiskLabel), result.Summary.RiskScore)
 		writer := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 		fmt.Fprintln(writer, "SEVERITY\tCONFIDENCE\tCATEGORY\tTYPE\tLINE\tVALUE")
-		for _, finding := range result.Findings {
+		for _, finding := range findings {
 			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%d\t%s\n",
 				finding.Severity, finding.Confidence, finding.Category, finding.Title, finding.Line, truncate(finding.Value, 80))
 		}
@@ -192,9 +207,9 @@ func printTable(results []analyzer.Result) {
 	}
 }
 
-func printPlain(results []analyzer.Result) {
+func printPlain(results []analyzer.Result, minSev string) {
 	for _, result := range results {
-		for _, finding := range result.Findings {
+		for _, finding := range filterByMinSeverity(result.Findings, minSev) {
 			fmt.Printf("%s\t%s\t%s\t%s\t%d\t%s\n",
 				result.Name, finding.Category, finding.Severity, finding.Title, finding.Line, finding.Value)
 		}
@@ -202,6 +217,36 @@ func printPlain(results []analyzer.Result) {
 			fmt.Printf("%s\terror\t-\t-\t0\t%s\n", result.Name, result.Error)
 		}
 	}
+}
+
+func severityRank(s analyzer.Severity) int {
+	switch s {
+	case analyzer.SevCritical:
+		return 5
+	case analyzer.SevHigh:
+		return 4
+	case analyzer.SevMedium:
+		return 3
+	case analyzer.SevLow:
+		return 2
+	case analyzer.SevInfo:
+		return 1
+	}
+	return 0
+}
+
+func filterByMinSeverity(findings []analyzer.Finding, minSev string) []analyzer.Finding {
+	rank := severityRank(analyzer.Severity(strings.ToLower(minSev)))
+	if rank == 0 {
+		return findings
+	}
+	out := make([]analyzer.Finding, 0, len(findings))
+	for _, f := range findings {
+		if severityRank(f.Severity) >= rank {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func printDiff(results []analyzer.Result, format string) {
@@ -285,14 +330,34 @@ func collectURLs(urlFlag, fileFlag string, args []string, stdinPiped bool) []str
 		}
 	}
 	if stdinPiped {
-		found, err := analyzer.ReadURLs(os.Stdin)
-		if err == nil {
-			for _, value := range found {
-				add(value)
-			}
+		for _, value := range readStdinURLs() {
+			add(value)
 		}
 	}
 	return urls
+}
+
+// readStdinURLs reads piped URL lists from stdin, but never blocks forever:
+// a non-TTY stdin with no data and no EOF (e.g. an idle pipe) would otherwise
+// hang the CLI indefinitely.
+func readStdinURLs() []string {
+	type result struct {
+		urls []string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		urls, err := analyzer.ReadURLs(os.Stdin)
+		ch <- result{urls, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err == nil {
+			return r.urls
+		}
+	case <-time.After(500 * time.Millisecond):
+	}
+	return nil
 }
 
 func collectJSFiles(raw string) []string {

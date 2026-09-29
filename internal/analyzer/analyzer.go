@@ -9,180 +9,27 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const MaxSourceBytes = 20 << 20
 
-type Severity string
-
+// Performance guardrails. Minified bundles can put megabytes on a single
+// line; without chunking and caps, regex scanning and result rendering grind
+// to a halt.
 const (
-	SevCritical Severity = "critical"
-	SevHigh     Severity = "high"
-	SevMedium   Severity = "medium"
-	SevLow      Severity = "low"
-	SevInfo     Severity = "info"
+	maxChunkLen            = 8192
+	chunkStep              = 7936 // maxChunkLen minus 256 bytes of overlap
+	maxMatchesPerScan      = 100
+	maxMatchesLongLine     = 5000
+	maxFindingsPerCategory = 400
+	maxTotalFindings       = 3000
 )
 
-type Confidence string
-
-const (
-	ConfHigh   Confidence = "high"
-	ConfMedium Confidence = "medium"
-	ConfLow    Confidence = "low"
-)
-
-type SourceKind string
-
-const (
-	SourceURL  SourceKind = "url"
-	SourceJS   SourceKind = "js"
-	SourceFile SourceKind = "file"
-)
-
-type SourceInput struct {
-	ID      string     `json:"id"`
-	Name    string     `json:"name"`
-	Kind    SourceKind `json:"kind"`
-	Origin  string     `json:"origin"`
-	Content string     `json:"content"`
-}
-
-type Finding struct {
-	ID         string     `json:"id"`
-	Category   string     `json:"category"`
-	Type       string     `json:"type"`
-	Title      string     `json:"title"`
-	Value      string     `json:"value"`
-	Line       int        `json:"line"`
-	Column     int        `json:"column"`
-	Context    string     `json:"context"`
-	Snippet    string     `json:"snippet"`
-	Severity   Severity   `json:"severity"`
-	Confidence Confidence `json:"confidence"`
-	Note       string     `json:"note,omitempty"`
-}
-
-type Summary struct {
-	TotalFindings      int            `json:"total_findings"`
-	ByCategory         map[string]int `json:"by_category"`
-	BySeverity         map[string]int `json:"by_severity"`
-	ByConfidence       map[string]int `json:"by_confidence"`
-	NetworkRequests    int            `json:"network_requests"`
-	SensitiveParams    int            `json:"sensitive_params"`
-	InterestingComment int            `json:"interesting_comments"`
-	RiskScore          int            `json:"risk_score"`
-	RiskLabel          string         `json:"risk_label"`
-}
-
-type Result struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Kind        SourceKind `json:"kind"`
-	Origin      string     `json:"origin"`
-	Status      string     `json:"status"`
-	StartedAt   string     `json:"started_at"`
-	CompletedAt string     `json:"completed_at,omitempty"`
-	FileSize    int        `json:"file_size"`
-	LineCount   int        `json:"line_count"`
-	Summary     Summary    `json:"summary"`
-	Findings    []Finding  `json:"findings"`
-	Error       string     `json:"error,omitempty"`
-}
-
-type detector struct {
-	category   string
-	name       string
-	title      string
-	severity   Severity
-	confidence Confidence
-	note       string
-	re         *regexp.Regexp
-}
-
-type requestDetector struct {
-	name       string
-	title      string
-	re         *regexp.Regexp
-	confidence Confidence
-}
-
-var placeholderHints = []string{
-	"example", "sample", "test", "placeholder", "your_", "your-", "<your",
-	"replace", "changeme", "dummy", "demo", "fake", "localhost", "000000",
-}
-
-var sensitiveParamNames = []string{
-	"token", "secret", "key", "password", "passwd", "pwd", "auth", "email", "session",
-}
-
-var lineDetectors = mustDetectors([]detector{
-	{category: "api_keys", name: "aws_access_key", title: "AWS Access Key", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`AKIA[0-9A-Z]{16}`)},
-	{category: "api_keys", name: "aws_secret_key", title: "AWS Secret Key", severity: SevCritical, confidence: ConfMedium, note: "Verify the 40-character value before treating as valid.", re: regexp.MustCompile(`(?i)aws.{0,20}secret.{0,20}['"][0-9a-zA-Z/+]{40}['"]`)},
-	{category: "api_keys", name: "google_api_key", title: "Google API Key", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`AIza[0-9A-Za-z\-_]{35}`)},
-	{category: "api_keys", name: "github_pat", title: "GitHub Token", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`ghp_[0-9a-zA-Z]{36}|github_pat_[0-9a-zA-Z_]{82}`)},
-	{category: "api_keys", name: "stripe_secret", title: "Stripe Secret Key", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`sk_live_[0-9a-zA-Z]{16,}`)},
-	{category: "api_keys", name: "stripe_public", title: "Stripe Publishable Key", severity: SevMedium, confidence: ConfHigh, re: regexp.MustCompile(`pk_live_[0-9a-zA-Z]{16,}`)},
-	{category: "api_keys", name: "paypal_token", title: "PayPal Production Token", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}`)},
-	{category: "api_keys", name: "slack_token", title: "Slack Token", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`xox[baprs]-[0-9a-zA-Z\-]{10,}`)},
-	{category: "api_keys", name: "slack_webhook", title: "Slack Webhook", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+`)},
-	{category: "api_keys", name: "firebase", title: "Firebase Reference", severity: SevMedium, confidence: ConfMedium, re: regexp.MustCompile(`[a-z0-9-]+\.firebaseio\.com`)},
-	{category: "api_keys", name: "firebase_msg", title: "Firebase Messaging Key", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{80,}`)},
-	{category: "api_keys", name: "jwt", title: "JWT Token", severity: SevHigh, confidence: ConfHigh, note: "Decode to inspect algorithm, expiry, and claims.", re: regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`)},
-	{category: "api_keys", name: "sendgrid", title: "SendGrid API Key", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`SG\.[a-zA-Z0-9_-]{22,}\.[a-zA-Z0-9_-]{43,}`)},
-	{category: "api_keys", name: "generic_key", title: "Generic API Key", severity: SevMedium, confidence: ConfLow, note: "Generic key pattern. Validate manually.", re: regexp.MustCompile(`(?i)(?:api[_-]?key|apikey|client[_-]?secret|access[_-]?token)\s*[:=]\s*['"][^'"]{12,}['"]`)},
-
-	{category: "credentials", name: "password", title: "Hardcoded Password", severity: SevHigh, confidence: ConfLow, re: regexp.MustCompile(`(?i)(?:password|passwd|pwd)\s*[:=]\s*['"][^'"]{6,}['"]`)},
-	{category: "credentials", name: "username", title: "Hardcoded Username", severity: SevLow, confidence: ConfLow, re: regexp.MustCompile(`(?i)(?:username|user|login)\s*[:=]\s*['"][^'"]{3,}['"]`)},
-	{category: "credentials", name: "basic_auth", title: "Basic Auth Header", severity: SevHigh, confidence: ConfHigh, re: regexp.MustCompile(`Authorization:\s*Basic\s+[A-Za-z0-9+/=]{12,}`)},
-	{category: "credentials", name: "bearer", title: "Bearer Token", severity: SevMedium, confidence: ConfMedium, re: regexp.MustCompile(`Authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*`)},
-	{category: "credentials", name: "db_conn", title: "Database Connection String", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`(?i)(?:mongodb|mysql|postgres|postgresql|redis|amqp|mssql):\/\/[^'">\s]{10,}`)},
-	{category: "credentials", name: "private_key", title: "Private Key Block", severity: SevCritical, confidence: ConfHigh, re: regexp.MustCompile(`-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----`)},
-
-	{category: "emails", name: "email", title: "Email Address", severity: SevInfo, confidence: ConfMedium, re: regexp.MustCompile(`\b[a-zA-Z0-9._%+\-]{1,64}@[a-zA-Z0-9.\-]{1,253}\.[a-zA-Z]{2,24}\b`)},
-
-	{category: "xss", name: "innerhtml", title: "innerHTML Assignment", severity: SevHigh, confidence: ConfMedium, note: "Check whether user-controlled input reaches the sink.", re: regexp.MustCompile(`\.innerHTML\s*[+]?=`)},
-	{category: "xss", name: "outerhtml", title: "outerHTML Assignment", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\.outerHTML\s*[+]?=`)},
-	{category: "xss", name: "document_write", title: "document.write Usage", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`document\.write(?:ln)?\s*\(`)},
-	{category: "xss", name: "eval", title: "eval() Usage", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\beval\s*\(`)},
-	{category: "xss", name: "function_ctor", title: "Function Constructor", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`new\s+Function\s*\(`)},
-	{category: "xss", name: "dangerously_set_inner_html", title: "React dangerouslySetInnerHTML", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`dangerouslySetInnerHTML\s*=\s*\{`)},
-	{category: "xss", name: "jquery_html", title: "jQuery html() Injection Point", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\$\([^)]+\)\.(?:html|append|prepend|before|after)\s*\(`)},
-	{category: "xss", name: "insert_adjacent_html", title: "insertAdjacentHTML Usage", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\.insertAdjacentHTML\s*\(`)},
-	{category: "xss", name: "srcdoc", title: "srcdoc Assignment", severity: SevHigh, confidence: ConfMedium, re: regexp.MustCompile(`\.srcdoc\s*=`)},
-
-	{category: "paths", name: "unix_path", title: "Unix Path", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?:^|['"\s])((?:/[\w.\-]+){2,})`)},
-	{category: "paths", name: "relative_path", title: "Relative Path", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?:\.{1,2}/[\w./\-]+\.(?:js|json|map|html|txt|env|graphql))`)},
-	{category: "paths", name: "windows_path", title: "Windows Path", severity: SevInfo, confidence: ConfMedium, re: regexp.MustCompile(`[A-Za-z]:\\(?:[^<>:"/\\|?*\r\n]+\\)*[^<>:"/\\|?*\r\n]*`)},
-	{category: "paths", name: "s3", title: "S3 Reference", severity: SevMedium, confidence: ConfHigh, re: regexp.MustCompile(`s3://[a-zA-Z0-9.\-_/]+|[a-zA-Z0-9\-]+\.s3(?:\.[a-z0-9\-]+)?\.amazonaws\.com`)},
-})
-
-var commentDetectors = mustDetectors([]detector{
-	{category: "comments", name: "todo", title: "TODO Comment", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?i)\bTODO\b`)},
-	{category: "comments", name: "fixme", title: "FIXME Comment", severity: SevInfo, confidence: ConfLow, re: regexp.MustCompile(`(?i)\bFIXME\b`)},
-	{category: "comments", name: "hack", title: "HACK Comment", severity: SevLow, confidence: ConfLow, re: regexp.MustCompile(`(?i)\bHACK\b`)},
-	{category: "comments", name: "security", title: "Security Comment", severity: SevMedium, confidence: ConfLow, note: "Comment references a sensitive topic. Review surrounding code.", re: regexp.MustCompile(`(?i)\b(security|vuln|bypass|insecure|workaround|token|secret|password|credential)\b`)},
-})
-
-var requestDetectors = []requestDetector{
-	{name: "fetch", title: "fetch() Request", re: regexp.MustCompile(`fetch\s*\(\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
-	{name: "axios", title: "axios Request", re: regexp.MustCompile(`axios(?:\.[a-z]+)?\s*\(\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
-	{name: "xhr", title: "XMLHttpRequest open()", re: regexp.MustCompile(`\.open\s*\(\s*['"][A-Z]+['"]\s*,\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
-	{name: "jquery_ajax", title: "jQuery AJAX Call", re: regexp.MustCompile(`\$\.(?:ajax|get|post)\s*\(\s*['"]([^'"]+)['"]`), confidence: ConfHigh},
-}
-
-var genericEndpointRe = regexp.MustCompile(`https?://[a-zA-Z0-9.\-_/?=&#%@+:]{8,}|/[a-zA-Z0-9._\-/]+(?:\?[a-zA-Z0-9=&_%\-@.:]+)?`)
-var queryParamRe = regexp.MustCompile(`[?&]([a-zA-Z0-9_.\-]{1,64})=`)
-var functionDeclRe = regexp.MustCompile(`function(?:\s+[A-Za-z0-9_$]+)?\s*\(([^)]{1,200})\)`)
-var arrowDeclRe = regexp.MustCompile(`(?:const|let|var)?\s*[A-Za-z0-9_$]*\s*=\s*\(([^)]{1,200})\)\s*=>`)
-var userInputRe = regexp.MustCompile(`location\.(?:hash|search|href)|document\.(?:URL|cookie|referrer)|window\.name|URLSearchParams|event\.data|req\.(?:body|query|params)`)
-
-func mustDetectors(items []detector) []detector {
-	return items
-}
+var browserUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0 Safari/537.36"
 
 func LoadURL(raw string) (SourceInput, error) {
 	raw = strings.TrimSpace(raw)
@@ -193,8 +40,14 @@ func LoadURL(raw string) (SourceInput, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return SourceInput{}, fmt.Errorf("invalid URL: %s", raw)
 	}
+	req, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		return SourceInput{}, err
+	}
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("Accept", "application/javascript, text/javascript, */*")
 	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Get(raw)
+	resp, err := client.Do(req)
 	if err != nil {
 		return SourceInput{}, err
 	}
@@ -205,6 +58,12 @@ func LoadURL(raw string) (SourceInput, error) {
 	if resp.ContentLength > MaxSourceBytes {
 		return SourceInput{}, fmt.Errorf("file exceeds %d MB limit", MaxSourceBytes>>20)
 	}
+	if ct := resp.Header.Get("Content-Type"); !looksLikeJS(ct, parsed.Path) {
+		if ct == "" {
+			ct = "unknown"
+		}
+		return SourceInput{}, fmt.Errorf("URL did not return JavaScript (Content-Type: %s)", ct)
+	}
 	limited := io.LimitReader(resp.Body, MaxSourceBytes+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
@@ -213,13 +72,29 @@ func LoadURL(raw string) (SourceInput, error) {
 	if len(body) > MaxSourceBytes {
 		return SourceInput{}, fmt.Errorf("file exceeds %d MB limit", MaxSourceBytes>>20)
 	}
+	name := filepath.Base(parsed.Path)
+	if name == "/" || name == "." || name == "" {
+		name = parsed.Host
+	}
 	return SourceInput{
 		ID:      SourceKey(SourceURL, raw),
-		Name:    filepath.Base(parsed.Path),
+		Name:    name,
 		Kind:    SourceURL,
 		Origin:  raw,
 		Content: string(body),
 	}, nil
+}
+
+func looksLikeJS(contentType, path string) bool {
+	ct := strings.ToLower(contentType)
+	if strings.Contains(ct, "javascript") || strings.Contains(ct, "ecmascript") {
+		return true
+	}
+	if strings.HasSuffix(strings.ToLower(path), ".js") {
+		return true
+	}
+	// Permissive: many servers mislabel JS as plain text or octet-stream.
+	return ct == "" || strings.HasPrefix(ct, "text/plain") || strings.HasPrefix(ct, "application/octet-stream")
 }
 
 func Analyze(input SourceInput) Result {
@@ -236,128 +111,24 @@ func Analyze(input SourceInput) Result {
 			ByCategory:   map[string]int{},
 			BySeverity:   map[string]int{},
 			ByConfidence: map[string]int{},
+			Truncated:    map[string]int{},
 		},
 	}
 
 	content := strings.ReplaceAll(input.Content, "\r\n", "\n")
 	lines := strings.Split(content, "\n")
 	result.LineCount = len(lines)
+	result.Minified = detectMinified(content, lines)
 	dedup := map[string]bool{}
 
 	for i, line := range lines {
-		lineNo := i + 1
-		trimmed := strings.TrimSpace(line)
-		context := trimContext(trimmed)
-
-		for _, d := range lineDetectors {
-			matches := d.re.FindAllStringIndex(line, -1)
-			for _, loc := range matches {
-				value := strings.TrimSpace(line[loc[0]:loc[1]])
-				if d.category == "emails" && !isStrictEmailMatch(line, loc[0], loc[1], value) {
-					continue
-				}
-				conf, note := adjustConfidence(d.confidence, value, trimmed)
-				sev := d.severity
-				if d.category == "xss" && userInputRe.MatchString(line) {
-					conf = ConfHigh
-					if sev == SevMedium {
-						sev = SevHigh
-					}
-					note = appendNote(note, "User-controlled input appears on the same line.")
-				}
-				addFinding(&result, dedup, Finding{
-					Category:   d.category,
-					Type:       d.name,
-					Title:      d.title,
-					Value:      normalizeValue(value),
-					Line:       lineNo,
-					Column:     loc[0] + 1,
-					Context:    context,
-					Snippet:    makeSnippet(lines, lineNo),
-					Severity:   sev,
-					Confidence: conf,
-					Note:       appendNote(note, d.note),
-				})
-			}
-		}
-
-		if isCommentLine(trimmed) {
-			for _, d := range commentDetectors {
-				if d.re.MatchString(trimmed) {
-					addFinding(&result, dedup, Finding{
-						Category:   d.category,
-						Type:       d.name,
-						Title:      d.title,
-						Value:      context,
-						Line:       lineNo,
-						Column:     1,
-						Context:    context,
-						Snippet:    makeSnippet(lines, lineNo),
-						Severity:   d.severity,
-						Confidence: d.confidence,
-						Note:       d.note,
-					})
-				}
-			}
-		}
-
-		for _, req := range requestDetectors {
-			matches := req.re.FindAllStringSubmatchIndex(line, -1)
-			for _, loc := range matches {
-				if len(loc) < 4 {
-					continue
-				}
-				value := line[loc[2]:loc[3]]
-				addFinding(&result, dedup, Finding{
-					Category:   "endpoints",
-					Type:       req.name,
-					Title:      req.title,
-					Value:      value,
-					Line:       lineNo,
-					Column:     loc[2] + 1,
-					Context:    context,
-					Snippet:    makeSnippet(lines, lineNo),
-					Severity:   SevInfo,
-					Confidence: req.confidence,
-				})
-			}
-		}
-
-		endpoints := genericEndpointRe.FindAllStringIndex(line, -1)
-		if !isCommentLine(trimmed) {
-			for _, loc := range endpoints {
-				value := strings.Trim(line[loc[0]:loc[1]], `"' )];,`)
-				if !looksLikeEndpoint(value) {
-					continue
-				}
-				addFinding(&result, dedup, Finding{
-					Category:   "endpoints",
-					Type:       "endpoint_literal",
-					Title:      "Endpoint Literal",
-					Value:      value,
-					Line:       lineNo,
-					Column:     loc[0] + 1,
-					Context:    context,
-					Snippet:    makeSnippet(lines, lineNo),
-					Severity:   SevInfo,
-					Confidence: ConfMedium,
-				})
-			}
-		}
-
-		extractQueryParams(&result, dedup, lines, lineNo, line, context)
-		extractFunctionParams(&result, dedup, lines, lineNo, line, context)
+		// processSegment handles long (minified) lines internally:
+		// literals are extracted once for the whole line, then only the
+		// stateless code patterns are scanned in chunks.
+		processSegment(&result, dedup, lines, i+1, 0, line)
 	}
 
-	sort.Slice(result.Findings, func(i, j int) bool {
-		if result.Findings[i].Line == result.Findings[j].Line {
-			if result.Findings[i].Category == result.Findings[j].Category {
-				return result.Findings[i].Column < result.Findings[j].Column
-			}
-			return result.Findings[i].Category < result.Findings[j].Category
-		}
-		return result.Findings[i].Line < result.Findings[j].Line
-	})
+	sortFindings(result.Findings)
 
 	result.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 	result.Summary.TotalFindings = len(result.Findings)
@@ -365,77 +136,278 @@ func Analyze(input SourceInput) Result {
 	return result
 }
 
-func extractQueryParams(result *Result, dedup map[string]bool, lines []string, lineNo int, line, context string) {
-	matches := queryParamRe.FindAllStringSubmatchIndex(line, -1)
-	for _, loc := range matches {
-		if len(loc) < 4 {
-			continue
+// processSegment analyzes one line (or one window of a long line).
+// colOffset is the byte offset of the segment within the line.
+func processSegment(result *Result, dedup map[string]bool, lines []string, lineNo, colOffset int, segment string) {
+	trimmed := strings.TrimSpace(segment)
+	if trimmed == "" {
+		return
+	}
+	context := trimContext(trimmed)
+
+	if isCommentLine(trimmed) {
+		for _, d := range commentDetectors {
+			if d.re.MatchString(trimmed) {
+				addFinding(result, dedup, Finding{
+					Category:   d.category,
+					Type:       d.name,
+					Title:      d.title,
+					Value:      context,
+					Line:       lineNo,
+					Column:     colOffset + 1,
+					Context:    context,
+					Snippet:    makeSnippet(lines, lineNo),
+					Severity:   d.severity,
+					Confidence: d.confidence,
+					Note:       d.note,
+				})
+			}
 		}
-		name := line[loc[2]:loc[3]]
-		severity := SevInfo
-		confidence := ConfMedium
-		title := "URL Query Parameter"
-		note := ""
-		if isSensitiveParam(name) {
-			severity = SevMedium
-			confidence = ConfHigh
-			title = "Sensitive Query Parameter"
-			note = "Sensitive parameter name detected."
+		return
+	}
+
+	if len(segment) <= maxChunkLen {
+		processChunk(result, dedup, lines, lineNo, colOffset, segment, context)
+		return
+	}
+
+	// Long (usually minified) line: literal extraction is stateful — a chunk
+	// that starts mid-literal would flip quote parity and corrupt every
+	// literal in the chunk. So extract literals once for the whole line,
+	// then scan the stateless code patterns in overlapping chunks.
+	stripped, lits := extractLiterals(segment)
+	reqSpans := collectRequestSpans(result, dedup, lines, lineNo, colOffset, segment, context)
+	for off := 0; off < len(segment); off += chunkStep {
+		end := off + maxChunkLen
+		if end > len(segment) {
+			end = len(segment)
 		}
-		addFinding(result, dedup, Finding{
-			Category:   "parameters",
-			Type:       "query_parameter",
-			Title:      title,
-			Value:      name,
-			Line:       lineNo,
-			Column:     loc[2] + 1,
-			Context:    context,
-			Snippet:    makeSnippet(lines, lineNo),
-			Severity:   severity,
-			Confidence: confidence,
-			Note:       note,
-		})
+		processCodePatterns(result, dedup, lines, lineNo, colOffset+off, segment[off:end], stripped[off:end], context)
+		if end == len(segment) {
+			break
+		}
+	}
+	for _, lit := range lits {
+		processLiteral(result, dedup, lines, lineNo, colOffset, segment, lit, reqSpans, context)
 	}
 }
 
-func extractFunctionParams(result *Result, dedup map[string]bool, lines []string, lineNo int, line, context string) {
-	paramLists := [][]string{}
-	for _, re := range []*regexp.Regexp{functionDeclRe, arrowDeclRe} {
-		matches := re.FindAllStringSubmatch(line, -1)
-		for _, match := range matches {
-			if len(match) < 2 {
+// processChunk handles a normal-length segment: extract literals, then run
+// code patterns and literal patterns.
+func processChunk(result *Result, dedup map[string]bool, lines []string, lineNo, colOffset int, segment, context string) {
+	stripped, lits := extractLiterals(segment)
+	reqSpans := collectRequestSpans(result, dedup, lines, lineNo, colOffset, segment, context)
+	processCodePatterns(result, dedup, lines, lineNo, colOffset, segment, stripped, context)
+	for _, lit := range lits {
+		processLiteral(result, dedup, lines, lineNo, colOffset, segment, lit, reqSpans, context)
+	}
+}
+
+// collectRequestSpans reports fetch()/axios/... calls and returns their
+// match spans so generic endpoint detection can skip already-reported URLs.
+func collectRequestSpans(result *Result, dedup map[string]bool, lines []string, lineNo, colOffset int, segment, context string) [][2]int {
+	reqSpans := [][2]int{}
+	// Long lines may hold thousands of calls; the per-category cap bounds
+	// output, so allow more matches here than in a normal chunk.
+	limit := maxMatchesPerScan
+	if len(segment) > maxChunkLen {
+		limit = maxMatchesLongLine
+	}
+	for _, d := range requestDetectors {
+		for _, loc := range d.re.FindAllStringSubmatchIndex(segment, limit) {
+			if len(loc) < 4 || loc[2] < 0 {
 				continue
 			}
-			paramLists = append(paramLists, strings.Split(match[1], ","))
+			value := segment[loc[2]:loc[3]]
+			if !looksLikeEndpoint(value) {
+				continue
+			}
+			reqSpans = append(reqSpans, [2]int{loc[0], loc[1]})
+			addFinding(result, dedup, Finding{
+				Category:   d.category,
+				Type:       d.name,
+				Title:      d.title,
+				Value:      normalizeValue(value),
+				Line:       lineNo,
+				Column:     colOffset + loc[2] + 1,
+				Context:    context,
+				Snippet:    makeSnippet(lines, lineNo),
+				Severity:   d.severity,
+				Confidence: d.confidence,
+			})
 		}
 	}
-	for _, params := range paramLists {
-		for _, raw := range params {
-			name := strings.TrimSpace(raw)
-			if name == "" {
+	return reqSpans
+}
+
+// processCodePatterns runs the code-scope detectors (DOM sinks, function
+// parameters) against a segment. `stripped` is the same segment with string
+// literal contents blanked; both share coordinates.
+func processCodePatterns(result *Result, dedup map[string]bool, lines []string, lineNo, colOffset int, segment, stripped, context string) {
+	// DOM sinks run against the line with literals blanked, except
+	// detectors marked raw, which need to see string arguments.
+	for _, d := range sinkDetectors {
+		src := stripped
+		if d.raw {
+			src = segment
+		}
+		for _, loc := range d.re.FindAllStringSubmatchIndex(src, maxMatchesPerScan) {
+			value := strings.TrimSpace(src[loc[0]:loc[1]])
+			conf, note := d.confidence, d.note
+			if userInputRe.MatchString(src) {
+				conf = ConfHigh
+				note = appendNote(note, "User-controlled input appears on the same line.")
+			}
+			addFinding(result, dedup, Finding{
+				Category:   d.category,
+				Type:       d.name,
+				Title:      d.title,
+				Value:      normalizeValue(value),
+				Line:       lineNo,
+				Column:     colOffset + loc[0] + 1,
+				Context:    context,
+				Snippet:    makeSnippet(lines, lineNo),
+				Severity:   d.severity,
+				Confidence: conf,
+				Note:       note,
+			})
+		}
+	}
+
+	// Function parameters: only sensitive-named ones are worth reporting.
+	seenParams := map[string]bool{}
+	for _, match := range functionDeclRe.FindAllStringSubmatchIndex(stripped, maxMatchesPerScan) {
+		collectSensitiveParams(result, dedup, lines, lineNo, colOffset, segment, context, match, seenParams)
+	}
+	for _, match := range arrowDeclRe.FindAllStringSubmatchIndex(stripped, maxMatchesPerScan) {
+		collectSensitiveParams(result, dedup, lines, lineNo, colOffset, segment, context, match, seenParams)
+	}
+}
+
+// processLiteral runs the value-scope detectors (secrets, endpoints,
+// parameters, paths, emails) against a single string literal. lit.start is
+// the literal's offset within segment; colOffset shifts to line coordinates.
+func processLiteral(result *Result, dedup map[string]bool, lines []string, lineNo, colOffset int, segment string, lit strLiteral, reqSpans [][2]int, context string) {
+	litCol := colOffset + lit.start
+	isEndpoint := false
+
+	for _, d := range secretDetectors {
+		for _, loc := range d.re.FindAllStringSubmatchIndex(lit.value, maxMatchesPerScan) {
+			g := d.group
+			if g < 0 || 2*g+1 >= len(loc) || loc[2*g] < 0 {
 				continue
 			}
-			severity := SevInfo
-			confidence := ConfMedium
-			title := "Function Parameter"
-			note := ""
-			if isSensitiveParam(name) {
-				severity = SevMedium
-				confidence = ConfHigh
-				title = "Sensitive Function Parameter"
-				note = "Sensitive parameter name detected."
+			raw := lit.value[loc[2*g]:loc[2*g+1]]
+			value := normalizeValue(raw)
+			conf, note := d.confidence, d.note
+			if d.validate != nil {
+				keep, vconf, vnote := d.validate(raw)
+				if !keep {
+					continue
+				}
+				if vconf != "" {
+					conf = vconf
+				}
+				note = appendNote(note, vnote)
 			}
-			column := strings.Index(line, name)
-			if column < 0 {
-				column = 0
+			if d.name == "email" && !emailOK(lit.value) {
+				continue
+			}
+			conf, note = downgradePlaceholder(conf, note, raw)
+			addFinding(result, dedup, Finding{
+				Category:   d.category,
+				Type:       d.name,
+				Title:      d.title,
+				Value:      value,
+				Line:       lineNo,
+				Column:     litCol + loc[2*g] + 1,
+				Context:    context,
+				Snippet:    makeSnippet(lines, lineNo),
+				Severity:   d.severity,
+				Confidence: conf,
+				Note:       note,
+			})
+		}
+	}
+
+	// Assigned secrets: a literal whose preceding key is sensitive-named,
+	// e.g. const password = "s3cr3t" or {"apiKey": "xyz"}. This catches
+	// the common case where key and value are separate literals.
+	if key := precedingKey(segment, lit.start); isSensitiveName(key) {
+		value := strings.TrimSpace(lit.value)
+		// A template literal with interpolation ("Bearer ${token}") holds a
+		// variable reference, not a hardcoded value. Email-shaped values are
+		// left to the email detector (or dropped as example domains).
+		if len(value) >= 4 && !isDummyValue(value) &&
+			!strings.Contains(value, "${") && !looksLikeEmail(value) {
+			typ, title, sev := "secret_value", "Hardcoded Secret", SevMedium
+			switch {
+			case isPasswordKey(key):
+				typ, title, sev = "password", "Hardcoded Password", SevHigh
+			case isUserKey(key):
+				typ, title, sev = "username", "Hardcoded Username", SevLow
+			}
+			conf, note := ConfMedium, "Value assigned to a sensitive-named key ("+key+")."
+			if isPlaceholder(value) {
+				conf = ConfLow
+				note = appendNote(note, "Value looks like a placeholder or example.")
+			}
+			addFinding(result, dedup, Finding{
+				Category:   "credentials",
+				Type:       typ,
+				Title:      title,
+				Value:      normalizeValue(value),
+				Line:       lineNo,
+				Column:     litCol + 1,
+				Context:    context,
+				Snippet:    makeSnippet(lines, lineNo),
+				Severity:   sev,
+				Confidence: conf,
+				Note:       note,
+			})
+		}
+	}
+
+	// Generic endpoint literal, unless already reported via a request wrapper.
+	if v := strings.TrimSpace(lit.value); looksLikeEndpoint(v) && !spanCovered(reqSpans, lit.start, lit.end) {
+		isEndpoint = true
+		title := "Endpoint Literal"
+		if strings.HasPrefix(v, "ws://") || strings.HasPrefix(v, "wss://") {
+			title = "WebSocket Endpoint"
+		}
+		addFinding(result, dedup, Finding{
+			Category:   "endpoints",
+			Type:       "endpoint_literal",
+			Title:      title,
+			Value:      normalizeValue(v),
+			Line:       lineNo,
+			Column:     litCol + 1,
+			Context:    context,
+			Snippet:    makeSnippet(lines, lineNo),
+			Severity:   SevInfo,
+			Confidence: ConfMedium,
+		})
+	}
+
+	// Query parameters, only inside URL-like literals.
+	if strings.Contains(lit.value, "?") {
+		for _, loc := range queryParamRe.FindAllStringSubmatchIndex(lit.value, maxMatchesPerScan) {
+			if len(loc) < 4 || loc[2] < 0 {
+				continue
+			}
+			name := lit.value[loc[2]:loc[3]]
+			severity, confidence, title, note := SevInfo, ConfMedium, "URL Query Parameter", ""
+			if isSensitiveName(name) {
+				severity, confidence, title = SevMedium, ConfHigh, "Sensitive Query Parameter"
+				note = "Sensitive parameter name detected."
 			}
 			addFinding(result, dedup, Finding{
 				Category:   "parameters",
-				Type:       "function_parameter",
+				Type:       "query_parameter",
 				Title:      title,
 				Value:      name,
 				Line:       lineNo,
-				Column:     column + 1,
+				Column:     litCol + loc[2] + 1,
 				Context:    context,
 				Snippet:    makeSnippet(lines, lineNo),
 				Severity:   severity,
@@ -444,14 +416,199 @@ func extractFunctionParams(result *Result, dedup map[string]bool, lines []string
 			})
 		}
 	}
+
+	// Path and filename patterns. A literal already reported as an endpoint
+	// is not reported again as a generic unix path.
+	for _, d := range pathDetectors {
+		for _, loc := range d.re.FindAllStringSubmatchIndex(lit.value, maxMatchesPerScan) {
+			value := strings.TrimSpace(lit.value[loc[0]:loc[1]])
+			if d.name == "unix_path" && isEndpoint {
+				continue
+			}
+			addFinding(result, dedup, Finding{
+				Category:   d.category,
+				Type:       d.name,
+				Title:      d.title,
+				Value:      normalizeValue(value),
+				Line:       lineNo,
+				Column:     litCol + loc[0] + 1,
+				Context:    context,
+				Snippet:    makeSnippet(lines, lineNo),
+				Severity:   d.severity,
+				Confidence: d.confidence,
+				Note:       d.note,
+			})
+		}
+	}
+}
+
+func collectSensitiveParams(result *Result, dedup map[string]bool, lines []string, lineNo, colOffset int, segment, context string, match []int, seen map[string]bool) {
+	if len(match) < 4 || match[2] < 0 {
+		return
+	}
+	for _, raw := range strings.Split(segment[match[2]:match[3]], ",") {
+		name := strings.TrimSpace(raw)
+		// Strip default values and destructuring noise: "opts = {}" -> "opts".
+		if idx := strings.IndexAny(name, " =:{"); idx > 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		if name == "" || seen[name] || !isSensitiveName(name) {
+			continue
+		}
+		seen[name] = true
+		column := strings.Index(segment, name)
+		if column < 0 {
+			column = 0
+		}
+		addFinding(result, dedup, Finding{
+			Category:   "parameters",
+			Type:       "function_parameter",
+			Title:      "Sensitive Function Parameter",
+			Value:      name,
+			Line:       lineNo,
+			Column:     colOffset + column + 1,
+			Context:    context,
+			Snippet:    makeSnippet(lines, lineNo),
+			Severity:   SevMedium,
+			Confidence: ConfHigh,
+			Note:       "Sensitive parameter name detected.",
+		})
+	}
+}
+
+// precedingKey returns the identifier immediately before a string literal's
+// opening quote, skipping whitespace, quotes, colons and equals signs.
+// For {"password": "x"} or password = "x", it returns "password".
+func precedingKey(segment string, quotePos int) string {
+	i := quotePos - 1
+	for i >= 0 {
+		c := segment[i]
+		if c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '`' || c == ':' || c == '=' {
+			i--
+			continue
+		}
+		break
+	}
+	end := i
+	for i >= 0 {
+		c := segment[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$' {
+			i--
+			continue
+		}
+		break
+	}
+	if end <= i {
+		return ""
+	}
+	return segment[i+1 : end+1]
+}
+
+func isPasswordKey(key string) bool {
+	for _, t := range tokenizeIdent(key) {
+		if t == "password" || t == "passwd" || t == "pwd" {
+			return true
+		}
+	}
+	return false
+}
+
+func isUserKey(key string) bool {
+	for _, t := range tokenizeIdent(key) {
+		if t == "user" || t == "username" || t == "login" {
+			return true
+		}
+	}
+	return false
+}
+
+// emailOK drops literal values that cannot contain a real email address.
+func emailOK(literalValue string) bool {
+	if strings.Contains(literalValue, "://") {
+		return false
+	}
+	lower := strings.ToLower(literalValue)
+	if isPlaceholder(literalValue) {
+		return false
+	}
+	for _, bad := range []string{"@localhost", ".local", ".invalid", "@example.", "@test."} {
+		if strings.Contains(lower, bad) {
+			return false
+		}
+	}
+	return true
+}
+
+func spanCovered(spans [][2]int, start, end int) bool {
+	for _, s := range spans {
+		if start >= s[0] && end <= s[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func downgradePlaceholder(conf Confidence, note, value string) (Confidence, string) {
+	if isPlaceholder(value) && conf == ConfHigh {
+		return ConfMedium, appendNote(note, "Value looks like a placeholder or example.")
+	}
+	return conf, note
+}
+
+// findingKey controls dedup granularity. High-volume categories (endpoints,
+// parameters, emails, paths) dedup on value alone — seeing the same string on
+// forty lines is one triage item, not forty.
+// sortFindings orders findings the way a triager reads them: most severe
+// first, then highest confidence, then file order.
+func sortFindings(findings []Finding) {
+	sevOrder := map[Severity]int{
+		SevCritical: 5,
+		SevHigh:     4,
+		SevMedium:   3,
+		SevLow:      2,
+		SevInfo:     1,
+	}
+	confOrder := map[Confidence]int{ConfHigh: 3, ConfMedium: 2, ConfLow: 1}
+	sort.Slice(findings, func(i, j int) bool {
+		if sevOrder[findings[i].Severity] != sevOrder[findings[j].Severity] {
+			return sevOrder[findings[i].Severity] > sevOrder[findings[j].Severity]
+		}
+		if findings[i].Confidence != findings[j].Confidence {
+			return confOrder[findings[i].Confidence] > confOrder[findings[j].Confidence]
+		}
+		if findings[i].Line != findings[j].Line {
+			return findings[i].Line < findings[j].Line
+		}
+		return findings[i].Column < findings[j].Column
+	})
+}
+
+func findingKey(f Finding) string {
+	switch f.Category {
+	case "endpoints", "parameters", "emails", "paths":
+		return f.Category + ":" + f.Type + ":" + f.Value
+	default:
+		return f.Category + ":" + f.Type + ":" + f.Value + ":" + strconv.Itoa(f.Line)
+	}
 }
 
 func addFinding(result *Result, dedup map[string]bool, finding Finding) {
-	key := strings.Join([]string{finding.Category, finding.Type, finding.Value, fmt.Sprint(finding.Line)}, ":")
+	if result.Summary.Truncated == nil {
+		result.Summary.Truncated = map[string]int{}
+	}
+	key := findingKey(finding)
 	if dedup[key] {
 		return
 	}
 	dedup[key] = true
+	if len(result.Findings) >= maxTotalFindings {
+		result.Summary.Truncated["total"]++
+		return
+	}
+	if result.Summary.ByCategory[finding.Category] >= maxFindingsPerCategory {
+		result.Summary.Truncated[finding.Category]++
+		return
+	}
 	finding.ID = stableID(key)
 	result.Findings = append(result.Findings, finding)
 	result.Summary.ByCategory[finding.Category]++
@@ -474,7 +631,7 @@ func computeRisk(findings []Finding) (int, string) {
 		SevHigh:     12,
 		SevMedium:   4,
 		SevLow:      1,
-		SevInfo:     0.25,
+		SevInfo:     0.15,
 	}
 	confWeight := map[Confidence]float64{
 		ConfHigh:   1.0,
@@ -513,23 +670,15 @@ func expApprox(x float64) float64 {
 	return total
 }
 
-func adjustConfidence(base Confidence, value, line string) (Confidence, string) {
-	if isPlaceholder(value) {
-		return ConfLow, "Value looks like a placeholder or example."
+func detectMinified(content string, lines []string) bool {
+	if len(lines) == 0 {
+		return false
 	}
-	if isCommentLine(strings.TrimSpace(line)) && base == ConfHigh {
-		return ConfMedium, "Value appears inside a comment."
+	if len(content)/len(lines) > 2000 {
+		return true
 	}
-	if isCommentLine(strings.TrimSpace(line)) && base == ConfMedium {
-		return ConfLow, "Value appears inside a comment."
-	}
-	return base, ""
-}
-
-func isPlaceholder(value string) bool {
-	lower := strings.ToLower(value)
-	for _, hint := range placeholderHints {
-		if strings.Contains(lower, hint) {
+	for _, l := range lines {
+		if len(l) > 100000 {
 			return true
 		}
 	}
@@ -537,7 +686,8 @@ func isPlaceholder(value string) bool {
 }
 
 func isCommentLine(line string) bool {
-	return strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") || strings.HasPrefix(line, "#")
+	return strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") ||
+		strings.HasPrefix(line, "*") || strings.HasPrefix(line, "#")
 }
 
 func trimContext(line string) string {
@@ -559,32 +709,16 @@ func makeSnippet(lines []string, lineNo int) string {
 	}
 	var b strings.Builder
 	for i := start; i <= end; i++ {
-		b.WriteString(fmt.Sprintf("%4d | %s", i, lines[i-1]))
+		content := lines[i-1]
+		if len(content) > 400 {
+			content = content[:400] + "..."
+		}
+		b.WriteString(fmt.Sprintf("%4d | %s", i, content))
 		if i < end {
 			b.WriteByte('\n')
 		}
 	}
 	return b.String()
-}
-
-func looksLikeEndpoint(value string) bool {
-	if value == "" || value == "/" || value == "//" || strings.HasPrefix(value, "//") {
-		return false
-	}
-	if strings.HasPrefix(value, "/") {
-		return strings.Count(value, "/") >= 1
-	}
-	return strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://")
-}
-
-func isSensitiveParam(name string) bool {
-	lower := strings.ToLower(strings.TrimSpace(name))
-	for _, item := range sensitiveParamNames {
-		if strings.Contains(lower, item) {
-			return true
-		}
-	}
-	return false
 }
 
 func normalizeValue(value string) string {
@@ -605,53 +739,6 @@ func appendNote(parts ...string) string {
 		}
 	}
 	return strings.Join(kept, " ")
-}
-
-func isStrictEmailMatch(line string, start, end int, value string) bool {
-	if strings.Count(value, "@") != 1 {
-		return false
-	}
-	localDomain := strings.Split(value, "@")
-	if len(localDomain) != 2 || localDomain[0] == "" || localDomain[1] == "" {
-		return false
-	}
-	if strings.Contains(localDomain[1], "..") || strings.HasPrefix(localDomain[1], ".") || strings.HasSuffix(localDomain[1], ".") {
-		return false
-	}
-	if start > 0 {
-		prev := line[start-1]
-		if prev == '/' || prev == ':' || prev == '@' {
-			return false
-		}
-	}
-	if end < len(line) {
-		next := line[end]
-		if next == '/' || next == ':' || next == '@' {
-			return false
-		}
-	}
-	tokenStart := start
-	for tokenStart > 0 && !isDelimiter(line[tokenStart-1]) {
-		tokenStart--
-	}
-	tokenEnd := end
-	for tokenEnd < len(line) && !isDelimiter(line[tokenEnd]) {
-		tokenEnd++
-	}
-	token := line[tokenStart:tokenEnd]
-	if strings.Contains(token, "://") || strings.Contains(token, "/@") || strings.Contains(token, "@/") {
-		return false
-	}
-	return true
-}
-
-func isDelimiter(ch byte) bool {
-	switch ch {
-	case ' ', '\t', '\n', '\r', '"', '\'', '`', '(', ')', '[', ']', '{', '}', ',', ';', '<', '>', '=':
-		return true
-	default:
-		return false
-	}
 }
 
 func sourceID(input SourceInput) string {
@@ -697,8 +784,4 @@ func ReadURLs(r io.Reader) ([]string, error) {
 		items = append(items, line)
 	}
 	return items, scanner.Err()
-}
-
-func (s SourceKind) String() string {
-	return string(s)
 }

@@ -8,6 +8,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -104,10 +105,39 @@ func createJobHandler(w http.ResponseWriter, r *http.Request) {
 
 	store.mu.Lock()
 	store.jobs[job.ID] = job
+	pruneJobs()
 	store.mu.Unlock()
 
 	go processJob(job.ID, sources)
 	jsonOK(w, map[string]any{"job_id": job.ID})
+}
+
+// pruneJobs keeps the in-memory store bounded: completed jobs beyond the
+// most recent 20 are dropped. Must be called with store.mu held.
+func pruneJobs() {
+	if len(store.jobs) <= 20 {
+		return
+	}
+	type entry struct {
+		id        string
+		updatedAt string
+	}
+	var completed []entry
+	for id, job := range store.jobs {
+		if job.Status == "completed" || job.Status == "failed" {
+			completed = append(completed, entry{id, job.UpdatedAt})
+		}
+	}
+	if len(store.jobs)-len(completed) >= 20 {
+		return // running jobs alone exceed the cap; leave them
+	}
+	sort.Slice(completed, func(i, j int) bool { return completed[i].updatedAt < completed[j].updatedAt })
+	for _, e := range completed {
+		if len(store.jobs) <= 20 {
+			break
+		}
+		delete(store.jobs, e.id)
+	}
 }
 
 func jobHandler(w http.ResponseWriter, r *http.Request) {
@@ -115,7 +145,23 @@ func jobHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	path := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	if id, ok := strings.CutSuffix(path, "/export"); ok {
+		exportHandler(w, r, id)
+		return
+	}
+	store.mu.RLock()
+	job, ok := store.jobs[path]
+	store.mu.RUnlock()
+	if !ok {
+		jsonError(w, "job not found", http.StatusNotFound)
+		return
+	}
+	jsonOK(w, job)
+}
+
+// exportHandler downloads a job's findings as CSV or JSON.
+func exportHandler(w http.ResponseWriter, r *http.Request, id string) {
 	store.mu.RLock()
 	job, ok := store.jobs[id]
 	store.mu.RUnlock()
@@ -123,7 +169,47 @@ func jobHandler(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "job not found", http.StatusNotFound)
 		return
 	}
-	jsonOK(w, job)
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	if format == "" {
+		format = "json"
+	}
+	filename := fmt.Sprintf("peelr-%s.%s", id, format)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+
+	switch format {
+	case "csv":
+		w.Header().Set("Content-Type", "text/csv")
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"file", "origin", "category", "type", "title", "severity", "confidence", "line", "column", "value", "note"})
+		for _, res := range job.Results {
+			for _, f := range res.Findings {
+				_ = cw.Write([]string{
+					res.Name, res.Origin, f.Category, f.Type, f.Title,
+					string(f.Severity), string(f.Confidence),
+					fmt.Sprintf("%d", f.Line), fmt.Sprintf("%d", f.Column),
+					f.Value, f.Note,
+				})
+			}
+		}
+		cw.Flush()
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		type exported struct {
+			analyzer.Finding
+			File   string `json:"file"`
+			Origin string `json:"origin"`
+		}
+		var out []exported
+		for _, res := range job.Results {
+			for _, f := range res.Findings {
+				out = append(out, exported{Finding: f, File: res.Name, Origin: res.Origin})
+			}
+		}
+		if out == nil {
+			out = []exported{}
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	}
 }
 
 func historyHandler(w http.ResponseWriter, r *http.Request) {
@@ -207,9 +293,19 @@ func collectJSSources(form *multipart.Form) ([]analyzer.SourceInput, error) {
 	}
 	seen := map[string]bool{}
 	var out []analyzer.SourceInput
+	var invalid []string
 	for _, raw := range urls {
 		jsURL := strings.TrimSpace(raw)
-		if jsURL == "" || seen[jsURL] || !looksLikeRemoteJS(jsURL) {
+		if jsURL == "" || seen[jsURL] {
+			continue
+		}
+		// Accept any http(s) URL. Whether it actually serves JavaScript is
+		// decided after fetching (see analyzer.LoadURL), and per-file errors
+		// are reported in the UI instead of silently dropping input.
+		if !(strings.HasPrefix(jsURL, "http://") || strings.HasPrefix(jsURL, "https://")) {
+			if len(invalid) < 3 {
+				invalid = append(invalid, jsURL)
+			}
 			continue
 		}
 		seen[jsURL] = true
@@ -219,6 +315,9 @@ func collectJSSources(form *multipart.Form) ([]analyzer.SourceInput, error) {
 			Kind:   analyzer.SourceURL,
 			Origin: jsURL,
 		})
+	}
+	if len(out) == 0 && len(invalid) > 0 {
+		return nil, fmt.Errorf("no valid URLs: %q %s", strings.Join(invalid, ", "), "— each line must start with http:// or https://")
 	}
 	return out, nil
 }
@@ -297,15 +396,6 @@ func setJobStatus(id, status, errMsg string) {
 	job.Status = status
 	job.Error = errMsg
 	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-}
-
-func looksLikeRemoteJS(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if !(strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://")) {
-		return false
-	}
-	lower := strings.ToLower(raw)
-	return strings.Contains(lower, ".js")
 }
 
 func jsonOK(w http.ResponseWriter, v any) {

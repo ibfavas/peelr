@@ -1,517 +1,523 @@
-const VERSION = "2.0.0";
+/* Peelr 3.0 UI — scan → prioritize → inspect → export.
+ * Performance notes: results re-render only when the job's completion count,
+ * the active filters, or dismissal state change (renderToken). Progress ticks
+ * update the bar and per-file rows in place. Finding lists are paginated and
+ * file cards use CSS content-visibility so minified mega-files stay smooth.
+ */
+"use strict";
 
-const CATEGORY_LABELS = {
-  api_keys: "API Keys",
-  credentials: "Credentials",
-  emails: "Emails",
-  xss: "XSS",
-  endpoints: "API Endpoints",
-  parameters: "Parameters",
-  paths: "Paths",
-  comments: "Comments",
-};
+const GROUPS = [
+  { id: "all",        label: "All",          cats: null },
+  { id: "secrets",    label: "Secrets",      cats: ["api_keys", "credentials"] },
+  { id: "xss",        label: "XSS & sinks",  cats: ["xss"] },
+  { id: "endpoints",  label: "Endpoints",    cats: ["endpoints"] },
+  { id: "parameters", label: "Parameters",   cats: ["parameters"] },
+  { id: "paths",      label: "Paths",        cats: ["paths"] },
+  { id: "emails",     label: "Emails",       cats: ["emails"] },
+  { id: "comments",   label: "Comments",     cats: ["comments"] },
+];
 
-const SEVERITIES = ["critical", "high", "medium", "low", "info"];
+const SEV_ORDER = ["critical", "high", "medium", "low", "info"];
+const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+const FINDINGS_PER_PAGE = 60;
 
 const state = {
+  jobId: null,
   job: null,
-  polling: null,
+  pollTimer: null,
   renderToken: "",
-  expandedResults: new Set(),
-  visibleResultLimit: 18,
-  queryTimer: null,
-  filters: {
-    category: "api_keys",
-    severity: "high",
-    query: "",
-    includeLowSignal: false,
-  },
+  group: "all",
+  severity: "all",
+  search: "",
+  dismissed: new Set(),
+  showDismissed: false,
+  expanded: new Set(),   // finding ids
+  pagesShown: {},        // result id -> number of pages
+  findingById: {},       // finding id -> finding object (rebuilt per render)
+  historyView: null,     // history record when inspecting one
 };
 
-window.addEventListener("DOMContentLoaded", boot);
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-function boot() {
-  const app = document.getElementById("app");
-  if (!app) return;
+/* ---------------- scan lifecycle ---------------- */
 
+$("scan").addEventListener("click", startScan);
+$("clear").addEventListener("click", () => {
+  $("urls").value = "";
+  $("file").value = "";
+  $("file-name").textContent = "";
+  hideScanError();
+});
+$("file").addEventListener("change", (e) => {
+  $("file-name").textContent = e.target.files.length ? e.target.files[0].name : "";
+});
+
+function showScanError(msg) {
+  const el = $("scan-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+function hideScanError() { $("scan-error").classList.add("hidden"); }
+
+async function startScan() {
+  const urls = $("urls").value.trim();
+  const file = $("file").files[0];
+  if (!urls && !file) {
+    showScanError("Paste some URLs or upload a list first.");
+    return;
+  }
+  hideScanError();
+  resetResults();
+
+  const form = new FormData();
+  if (urls) form.append("urls", urls);
+  if (file) form.append("file", file);
+
+  const btn = $("scan");
+  btn.disabled = true;
+  btn.textContent = "Scanning…";
   try {
-    app.innerHTML = buildMarkup();
-    bindEvents();
-  } catch (error) {
-    app.innerHTML = `
-      <div style="padding:24px;color:#fff;font-family:monospace">
-        <h2>Peelr UI failed to load</h2>
-        <pre>${escapeHtml(String(error && error.stack ? error.stack : error))}</pre>
-      </div>
-    `;
+    const res = await fetch("/api/jobs", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Scan failed to start");
+    state.jobId = data.job_id;
+    $("progress-card").classList.remove("hidden");
+    $("results-section").classList.remove("hidden");
+    pollJob();
+    state.pollTimer = setInterval(pollJob, 1500);
+  } catch (err) {
+    showScanError(err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Scan";
   }
 }
 
-function buildMarkup() {
-  return `
-    <div class="app-shell">
-      <section class="hero-window">
-        <div class="hero-bar">
-          <div class="hero-dots"><span></span><span></span><span></span></div>
-          <div class="hero-title">peelr://${VERSION}</div>
-        </div>
-        <div class="hero-body">
-          <div class="brand-panel">
-            <pre class="ascii">    ____            __
-   / __ \\___  ___  / /____
-  / /_/ / _ \\/ _ \\/ / ___/
- / ____/  __/  __/ / /
-/_/    \\___/\\___/_/_/</pre>
-            <div class="hero-copy">
-              <h1>JavaScript Recon Console</h1>
-              <p>Paste JavaScript URLs directly or upload a JavaScript URL list for focused analysis without domain discovery overhead.</p>
-            </div>
-          </div>
+function resetResults() {
+  stopPolling();
+  state.job = null;
+  state.jobId = null;
+  state.historyView = null;
+  state.renderToken = "";
+  state.group = "all";
+  state.severity = "all";
+  state.search = "";
+  state.dismissed = new Set();
+  state.showDismissed = false;
+  state.expanded = new Set();
 
-          <div class="fastfetch-panel">
-            ${fastfetchRow("engine", "go stdlib")}
-            ${fastfetchRow("input", "javascript urls only")}
-            ${fastfetchRow("upload", "txt, csv, list")}
-            ${fastfetchRow("focus", "secrets, xss, endpoints, params")}
-            ${fastfetchRow("output", "live grouped results with show code")}
-            ${fastfetchRow("theme", "cyberpunk terminal")}
-          </div>
-        </div>
-
-      </section>
-
-      <section class="control-window">
-        <div class="window-head">
-          <div>
-            <h2>Scan JavaScript URLs</h2>
-            <p>Provide one or more direct JavaScript URLs. Peelr fetches each file and analyzes the result.</p>
-          </div>
-          <div class="head-badge">dark console ui</div>
-        </div>
-
-        <div class="command-strip">
-          <span class="prompt">guest@peelr:~$</span>
-          <span>analyze js-urls --fetch</span>
-        </div>
-
-        <div class="mode-panel" id="pane-js">
-          <div class="field-grid">
-            <label class="input-block wide">
-              <span>JavaScript URLs</span>
-              <textarea id="js-urls-input" placeholder="https://target.com/app.js&#10;https://cdn.target.com/vendor.min.js"></textarea>
-              <small>Paste direct JavaScript URLs. Peelr will fetch and analyze each file.</small>
-            </label>
-            <div class="input-block">
-              <span>Upload JS URL list</span>
-              ${uploadBox("js-upload-btn", "js-files", "js-upload-name", "Choose list")}
-              <small>Accepts one JavaScript URL per line.</small>
-            </div>
-          </div>
-        </div>
-
-        <div class="actions-row">
-          <button id="run-btn" class="run-btn">Run Analysis</button>
-          <div id="run-meta" class="run-meta">idle</div>
-        </div>
-      </section>
-
-      <section class="status-window">
-        <div class="stats-row">
-          ${statCard("sources", "0", "js files queued")}
-          ${statCard("processed", "0", "finished scans")}
-          ${statCard("findings", "0", "total matches")}
-          ${statCard("high risk", "0", "critical or high")}
-        </div>
-
-        <div class="runtime-card">
-          <div class="window-head compact">
-            <h2>Runtime</h2>
-            <div id="job-status" class="status-pill idle">waiting</div>
-          </div>
-          <div class="runtime-log">
-            <div><span class="prompt">log&gt;</span> scheduler ready</div>
-            <div id="job-summary">No analysis has been started.</div>
-          </div>
-          <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
-        </div>
-      </section>
-
-      <section class="results-window">
-        <div class="window-head">
-          <div>
-            <h2>Analysis Results</h2>
-            <p>High-signal findings are prioritized by default. Low and info items stay available without flooding the browser.</p>
-          </div>
-          <div class="results-controls">
-            <label class="search-block">
-              <span>Search</span>
-              <input id="filter-query" type="text" placeholder="token, innerHTML, /api, email">
-            </label>
-            <button id="low-signal-toggle" class="chip-btn secondary-chip" type="button">Include Lower-Signal</button>
-          </div>
-        </div>
-
-        <div class="filter-stack">
-          <div class="button-group wrap">${categoryButtons()}</div>
-          <div class="button-group wrap">${severityButtons()}</div>
-        </div>
-
-        <div id="results" class="results-list">
-          <div class="empty-state">
-            <div class="empty-title">Ready</div>
-            <p>Run a scan and the JavaScript URL analysis will appear here.</p>
-          </div>
-        </div>
-      </section>
-    </div>
-  `;
+  state.pagesShown = {};
+  $("cat-tabs").innerHTML = "";
+  $("stats").innerHTML = "";
+  $("files").innerHTML = "";
+  $("sev-filter").value = "all";
+  $("search").value = "";
+  $("dismiss-bar").classList.add("hidden");
+  $("results-section").classList.add("hidden");
+  $("progress-card").classList.add("hidden");
 }
 
-function categoryButtons() {
-  return Object.keys(CATEGORY_LABELS).map((key) => {
-    const active = key === "api_keys" ? "active" : "";
-    return `<button class="chip-btn ${active}" data-category="${key}">${CATEGORY_LABELS[key]}</button>`;
-  }).join("");
-}
-
-function severityButtons() {
-  return SEVERITIES.map((severity) => {
-    const active = severity === "high" ? "active" : "";
-    return `<button class="chip-btn ${active}" data-severity="${severity}">${capitalize(severity)}</button>`;
-  }).join("");
-}
-
-function fastfetchRow(label, value) {
-  return `<div class="fastfetch-row"><span>${label}</span><strong>${value}</strong></div>`;
-}
-
-function featureCard(label, value) {
-  return `<div class="feature-card"><div class="feature-title">${label}</div><div class="feature-text">${value}</div></div>`;
-}
-
-function statCard(label, value, hint) {
-  return `<div class="stat-card"><span>${label}</span><strong data-stat="${label}">${value}</strong><small>${hint}</small></div>`;
-}
-
-function uploadBox(buttonId, inputId, nameId, buttonLabel) {
-  return `
-    <div class="upload-box">
-      <input id="${inputId}" class="hidden-file" type="file" multiple accept=".txt,.csv,.list">
-      <button id="${buttonId}" type="button" class="upload-btn">${buttonLabel}</button>
-      <div id="${nameId}" class="upload-name">No file selected</div>
-    </div>
-  `;
-}
-
-function bindEvents() {
-  document.querySelectorAll("[data-category]").forEach((btn) => {
-    btn.addEventListener("click", () => setCategory(btn.dataset.category));
-  });
-  document.querySelectorAll("[data-severity]").forEach((btn) => {
-    btn.addEventListener("click", () => setSeverity(btn.dataset.severity));
-  });
-  byId("filter-query").addEventListener("input", (event) => {
-    clearTimeout(state.queryTimer);
-    state.queryTimer = setTimeout(() => {
-      state.filters.query = event.target.value.trim().toLowerCase();
-      renderResults();
-    }, 120);
-  });
-  byId("low-signal-toggle").addEventListener("click", toggleLowSignal);
-  byId("run-btn").addEventListener("click", startJob);
-  bindUploadPicker("js-upload-btn", "js-files", "js-upload-name");
-  byId("results").addEventListener("click", handleResultsClick);
-}
-
-function bindUploadPicker(buttonId, inputId, nameId) {
-  const button = byId(buttonId);
-  const input = byId(inputId);
-  const name = byId(nameId);
-  if (!button || !input || !name) return;
-  button.addEventListener("click", () => input.click());
-  input.addEventListener("change", () => {
-    name.textContent = input.files.length
-      ? Array.from(input.files).map((file) => file.name).join(", ")
-      : "No file selected";
-  });
-}
-
-function setCategory(category) {
-  state.filters.category = category;
-  document.querySelectorAll("[data-category]").forEach((btn) => btn.classList.toggle("active", btn.dataset.category === category));
-  renderResults();
-}
-
-function setSeverity(severity) {
-  state.filters.severity = severity;
-  document.querySelectorAll("[data-severity]").forEach((btn) => btn.classList.toggle("active", btn.dataset.severity === severity));
-  renderResults();
-}
-
-function toggleLowSignal() {
-  state.filters.includeLowSignal = !state.filters.includeLowSignal;
-  byId("low-signal-toggle").classList.toggle("active", state.filters.includeLowSignal);
-  byId("low-signal-toggle").textContent = state.filters.includeLowSignal ? "Hide Lower-Signal" : "Include Lower-Signal";
-  renderResults();
-}
-
-async function startJob() {
-  const formData = new FormData();
-  formData.append("mode", "js");
-  formData.append("urls", byId("js-urls-input").value);
-  for (const file of byId("js-files").files) {
-    formData.append("uploads", file);
+function stopPolling() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
   }
+}
 
-  setRunState("submitting");
+async function pollJob() {
+  if (!state.jobId) return;
   try {
-    const response = await fetch("/api/jobs", { method: "POST", body: formData });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "unable to create job");
-    }
-    state.job = null;
-    state.expandedResults.clear();
-    state.visibleResultLimit = 18;
-    state.renderToken = "";
-    pollJob(payload.job_id);
-  } catch (error) {
-    setRunState(error.message, true);
+    const res = await fetch("/api/jobs/" + encodeURIComponent(state.jobId));
+    if (!res.ok) throw new Error("job lost");
+    state.job = await res.json();
+    updateProgress();
+    maybeRenderResults();
+    if (state.job.status === "completed") stopPolling();
+  } catch (err) {
+    stopPolling();
+    showScanError("Lost contact with the scan. Refresh to try again.");
   }
 }
 
-function pollJob(jobID) {
-  clearInterval(state.polling);
-  fetchJob(jobID);
-  state.polling = setInterval(() => fetchJob(jobID), 1200);
-}
-
-async function fetchJob(jobID) {
-  try {
-    const response = await fetch(`/api/jobs/${jobID}`);
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "unable to load job");
-    }
-    state.job = payload;
-    renderJob();
-    renderResults();
-    if (payload.status === "completed") {
-      clearInterval(state.polling);
-      state.polling = null;
-      setRunState(`completed ${payload.completed}/${payload.total}`);
-    }
-  } catch (error) {
-    clearInterval(state.polling);
-    state.polling = null;
-    setRunState(error.message, true);
-  }
-}
-
-function renderJob() {
-  if (!state.job) return;
+function updateProgress() {
   const job = state.job;
-  const findings = job.results.reduce((sum, result) => sum + ((result.findings || []).length), 0);
-  const highRisk = job.results.filter((result) => ["critical", "high"].includes(result.summary && result.summary.risk_label)).length;
-  const progress = job.total ? Math.round((job.completed / job.total) * 100) : 0;
+  const pct = job.total ? Math.round((job.completed / job.total) * 100) : 0;
+  $("bar").style.width = pct + "%";
+  const pill = $("job-status");
+  pill.textContent = job.status;
+  pill.className = "pill" + (job.status === "running" ? " running" : job.status === "completed" ? " completed" : "");
+  $("progress-text").textContent = `${job.completed} of ${job.total} files analyzed`;
 
-  updateStat("sources", String(job.total));
-  updateStat("processed", String(job.completed));
-  updateStat("findings", String(findings));
-  updateStat("high risk", String(highRisk));
-  byId("progress-fill").style.width = `${progress}%`;
+  const box = $("file-status");
+  const html = job.results.map((r) => {
+    const name = esc(r.name || r.id);
+    let status;
+    if (r.status === "completed") status = '<span class="dot-ok">✓ done</span>';
+    else if (r.status === "failed") status = '<span class="dot-err">✗ failed</span>';
+    else status = '<span class="spin"></span>';
+    return `<div class="file-row"><span class="fname">${name}</span><span class="fstat">${status}</span></div>`;
+  }).join("");
+  if (box.dataset.html !== html) {
+    box.innerHTML = html;
+    box.dataset.html = html;
+  }
+}
 
-  const statusEl = byId("job-status");
-  statusEl.textContent = job.status;
-  statusEl.className = `status-pill ${job.status}`;
-  byId("job-summary").textContent = `log> ${job.completed}/${job.total} javascript files processed, ${findings} findings collected`;
+/* ---------------- rendering ---------------- */
+
+function allFindings() {
+  if (state.historyView) {
+    const rec = state.historyView;
+    return [{ id: "history", name: rec.name, origin: rec.origin, kind: rec.kind,
+              status: "completed", findings: rec.findings || [], summary: {} }];
+  }
+  return (state.job && state.job.results) || [];
+}
+
+function sevPasses(f) {
+  if (state.severity === "all") return true;
+  const rank = SEV_RANK[f.severity] ?? 0;
+  if (state.severity === "critical") return rank >= 4;
+  if (state.severity === "high") return rank >= 3;
+  if (state.severity === "medium") return rank >= 2;
+  return true;
+}
+
+function filterFindings(list) {
+  const grp = GROUPS.find((g) => g.id === state.group);
+  const q = state.search.trim().toLowerCase();
+  return list.filter((f) => {
+    if (grp.cats && !grp.cats.includes(f.category)) return false;
+    if (!sevPasses(f)) return false;
+    if (!state.showDismissed && state.dismissed.has(f.id)) return false;
+    if (q) {
+      const hay = ((f.title || "") + " " + (f.value || "") + " " + (f.note || "")).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function maybeRenderResults() {
+  // Works for both live jobs and the read-only history view.
+  const srcId = state.historyView
+    ? "history:" + (state.historyView.source_id || state.historyView.name)
+    : state.jobId;
+  if (!srcId) return;
+  const completed = state.job ? state.job.completed : 0;
+  const total = state.job ? state.job.total : 0;
+  const token = [srcId, completed, total, state.group, state.severity,
+                 state.search, state.showDismissed, state.dismissed.size].join("|");
+  if (token === state.renderToken) return;
+  state.renderToken = token;
+  renderResults();
 }
 
 function renderResults() {
-  const root = byId("results");
-  if (!state.job || !root) return;
+  const results = allFindings();
+  const done = results.filter((r) => r.status === "completed" || r.status === "failed");
+  const totalFindings = done.reduce((n, r) => n + (r.findings ? r.findings.length : 0), 0);
 
-  const completed = (state.job.results || []).filter((result) => result.status === "completed" || result.status === "failed");
-  const pendingCount = Math.max(0, (state.job.total || 0) - completed.length);
-  const sorted = completed.slice().sort(compareResults);
-  const renderable = sorted.filter((result) => shouldRenderResult(result));
-  const visible = renderable.slice(0, state.visibleResultLimit);
-  const hiddenResults = Math.max(0, renderable.length - visible.length);
+  // id -> finding lookup for surgical expand/collapse
+  state.findingById = {};
+  for (const r of done) for (const f of r.findings || []) state.findingById[f.id] = f;
 
-  const token = JSON.stringify({
-    status: state.job.status,
-    completed: state.job.completed,
-    total: state.job.total,
-    filters: state.filters,
-    visibleResultLimit: state.visibleResultLimit,
-    expanded: Array.from(state.expandedResults).sort(),
-    results: completed.map((result) => ({
-      id: result.id,
-      error: result.error,
-      status: result.status,
-      risk: result.summary && result.summary.risk_label,
-      findings: (result.findings || []).length,
-    })),
-  });
-  if (token === state.renderToken) return;
-  state.renderToken = token;
-
-  const cards = visible.map((result) => renderResultCard(result)).join("");
-  const pending = pendingCount > 0 ? `<div class="pending-summary">${pendingCount} files are still being fetched or analyzed.</div>` : "";
-  const more = hiddenResults > 0 ? `<button class="more-results-btn" data-expand-results="true">Show ${hiddenResults} more files</button>` : "";
-  root.innerHTML = cards || pending || `<div class="empty-state"><div class="empty-title">No Matches</div><p>The current filters hide all findings or the analyzed JavaScript was clean.</p></div>`;
-  if (cards) {
-    root.insertAdjacentHTML("beforeend", `${pending}${more}`);
+  // stats
+  const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  let secrets = 0;
+  for (const r of done) {
+    for (const f of r.findings || []) {
+      if (counts[f.severity] !== undefined) counts[f.severity]++;
+      if (f.category === "api_keys" || f.category === "credentials") secrets++;
+    }
   }
-}
+  const maxSev = SEV_ORDER.find((s) => counts[s] > 0) || "minimal";
+  $("stats").innerHTML =
+    stat("Files", done.length) +
+    stat("Findings", totalFindings) +
+    stat("Secrets", secrets, "secrets") +
+    stat("Critical", counts.critical, "critical") +
+    stat("High", counts.high, "high") +
+    `<div class="stat"><div class="num"><span class="risk-badge risk-${maxSev}">${maxSev === "minimal" ? "clean" : maxSev}</span></div><div class="lbl">Top risk</div></div>`;
 
-function shouldRenderResult(result) {
-  if (result.error) return true;
-  if (state.job && state.job.status !== "completed") return true;
-  return filterFindings(result.findings || []).length > 0;
-}
-
-function renderResultCard(result) {
-  const filtered = filterFindings(result.findings || []);
-  const findings = state.expandedResults.has(result.id) ? filtered : filtered.slice(0, 24);
-  const hiddenCount = filtered.length - findings.length;
-  if (state.job && state.job.status === "completed" && filtered.length === 0 && !result.error) return "";
-
-  return `
-    <article class="result-card">
-      <div class="result-head">
-        <div>
-          <div class="result-name">${escapeHtml(result.name || result.origin || "source")}</div>
-          <div class="result-origin">${escapeHtml(result.origin || result.kind || "")}</div>
-        </div>
-        <div class="risk-badge ${(result.summary && result.summary.risk_label) || "minimal"}">${(result.summary && result.summary.risk_label) || result.status}</div>
-      </div>
-      <div class="result-meta">
-        <span>${result.line_count || 0} lines</span>
-        <span>${(result.findings || []).length} findings</span>
-        <span>${filtered.length} visible</span>
-        <span>${(result.summary && result.summary.network_requests) || 0} requests</span>
-        <span>${(result.summary && result.summary.sensitive_params) || 0} sensitive params</span>
-      </div>
-      ${result.error ? `<div class="error-box">${escapeHtml(result.error)}</div>` : renderFindingList(result.id, findings, hiddenCount, result.status)}
-    </article>
-  `;
-}
-
-function renderFindingList(resultID, findings, hiddenCount, status) {
-  if (!findings.length) {
-    return `<div class="pending-box">${status === "completed" ? "No findings match the current filters." : "Waiting for analysis output..."}</div>`;
-  }
-
-  const rows = findings.map((finding) => `
-    <div class="finding ${finding.severity}">
-      <div class="finding-head">
-        <div>
-          <div class="finding-title">${escapeHtml(finding.title)}</div>
-          <div class="finding-sub">${escapeHtml(CATEGORY_LABELS[finding.category] || finding.category)} · line ${finding.line} · ${escapeHtml(finding.confidence)}</div>
-        </div>
-        <span class="sev-tag ${finding.severity}">${finding.severity}</span>
-      </div>
-      <div class="finding-value">${escapeHtml(finding.value || finding.context || "")}</div>
-      ${renderFindingContext(finding)}
-      ${finding.note ? `<div class="finding-note">${escapeHtml(finding.note)}</div>` : ""}
-      <details class="snippet">
-        <summary>Show Code</summary>
-        <pre>${escapeHtml(trimSnippet(finding.snippet || ""))}</pre>
-      </details>
-    </div>
-  `).join("");
-
-  if (hiddenCount <= 0) return rows;
-  return `${rows}<button class="more-btn" data-expand-result="${escapeHtml(resultID)}">Show ${hiddenCount} more findings</button>`;
-}
-
-function filterFindings(findings) {
-  return findings
-    .filter((finding) => {
-      if (!state.filters.includeLowSignal && !state.filters.query) {
-        if (finding.severity === "low" || finding.severity === "info") return false;
-      }
-      if (state.filters.category && finding.category !== state.filters.category) return false;
-      if (state.filters.severity && finding.severity !== state.filters.severity) return false;
-      if (!state.filters.query) return true;
-      const haystack = `${finding.title} ${finding.value} ${finding.context} ${finding.note || ""}`.toLowerCase();
-      return haystack.includes(state.filters.query);
+  // category tabs with counts
+  const byCat = {};
+  for (const r of done) for (const f of r.findings || []) byCat[f.category] = (byCat[f.category] || 0) + 1;
+  $("cat-tabs").innerHTML = GROUPS.map((g) => {
+    const n = g.cats ? g.cats.reduce((s, c) => s + (byCat[c] || 0), 0) : totalFindings;
+    const active = state.group === g.id ? " active" : "";
+    return `<button class="tab${active}" role="tab" data-group="${g.id}">${esc(g.label)}<span class="count">${n}</span></button>`;
+  }).join("");
+  document.querySelectorAll("#cat-tabs .tab").forEach((t) =>
+    t.addEventListener("click", () => {
+      state.group = t.dataset.group;
+      maybeRenderResults();
     })
-    .sort(compareFindings);
-}
+  );
 
-function compareResults(a, b) {
-  const riskOrder = { critical: 5, high: 4, medium: 3, low: 2, minimal: 1 };
-  const aRisk = riskOrder[(a.summary && a.summary.risk_label) || "minimal"] || 0;
-  const bRisk = riskOrder[(b.summary && b.summary.risk_label) || "minimal"] || 0;
-  if (aRisk !== bRisk) return bRisk - aRisk;
-  return ((b.findings || []).length - (a.findings || []).length);
-}
-
-function compareFindings(a, b) {
-  const severityOrder = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
-  const aSeverity = severityOrder[a.severity] || 0;
-  const bSeverity = severityOrder[b.severity] || 0;
-  if (aSeverity !== bSeverity) return bSeverity - aSeverity;
-  if (a.confidence !== b.confidence) {
-    const confidenceOrder = { high: 3, medium: 2, low: 1 };
-    return (confidenceOrder[b.confidence] || 0) - (confidenceOrder[a.confidence] || 0);
+  // dismiss bar
+  if (state.dismissed.size) {
+    $("dismiss-bar").classList.remove("hidden");
+    $("dismiss-count").textContent = `${state.dismissed.size} dismissed`;
+    $("toggle-dismissed").textContent = state.showDismissed ? "Hide dismissed" : "Show dismissed";
+  } else {
+    $("dismiss-bar").classList.add("hidden");
   }
-  return a.line - b.line;
-}
 
-function handleResultsClick(event) {
-  const expandResultsButton = event.target.closest("[data-expand-results]");
-  if (expandResultsButton) {
-    state.visibleResultLimit += 18;
-    renderResults();
-    return;
+  // file groups
+  const filesEl = $("files");
+  const cards = [];
+  let anyVisible = false;
+  const sorted = [...done].sort((a, b) => fileRiskRank(b) - fileRiskRank(a));
+  for (const r of sorted) {
+    const visible = filterFindings(r.findings || []);
+    const dismissedHere = (r.findings || []).filter((f) => state.dismissed.has(f.id)).length;
+    if (!visible.length && !dismissedHere) {
+      if (state.search || state.group !== "all" || state.severity !== "all") continue;
+    }
+    anyVisible = anyVisible || visible.length > 0;
+    cards.push(fileCard(r, visible, dismissedHere));
   }
-  const expandButton = event.target.closest("[data-expand-result]");
-  if (!expandButton) return;
-  const id = expandButton.getAttribute("data-expand-result");
-  if (!id) return;
-  state.expandedResults.add(id);
-  renderResults();
+  filesEl.innerHTML = cards.join("");
+  $("no-match").classList.toggle("hidden", anyVisible);
+
+  // wire up interactions
+  document.querySelectorAll(".file-head").forEach((h) =>
+    h.addEventListener("click", () => {
+      const card = h.closest(".file-card");
+      card.classList.toggle("closed");
+    })
+  );
+  document.querySelectorAll(".finding").forEach((el) => {
+    const row = el.querySelector(".finding-row");
+    if (row) wireFinding(el, row.dataset.fid);
+  });
+  document.querySelectorAll(".show-more").forEach((b) =>
+    b.addEventListener("click", () => {
+      const rid = b.dataset.rid;
+      state.pagesShown[rid] = (state.pagesShown[rid] || 1) + 1;
+      state.renderToken = ""; // force re-render
+      maybeRenderResults();
+    })
+  );
 }
 
-function updateStat(label, value) {
-  const node = document.querySelector(`[data-stat="${label}"]`);
-  if (node) node.textContent = value;
+function stat(label, n, cls) {
+  return `<div class="stat${cls ? " " + cls : ""}"><div class="num">${n}</div><div class="lbl">${esc(label)}</div></div>`;
 }
 
-function setRunState(text, isError) {
-  const meta = byId("run-meta");
-  if (!meta) return;
-  meta.textContent = text;
-  meta.classList.toggle("error", !!isError);
+function fileRiskRank(r) {
+  let best = -1;
+  for (const f of r.findings || []) best = Math.max(best, SEV_RANK[f.severity] ?? 0);
+  return best;
 }
 
-function byId(id) {
-  return document.getElementById(id);
+function fileCard(r, visible, dismissedCount) {
+  const rid = r.id;
+  const maxSev = SEV_ORDER.find((s) => (r.findings || []).some((f) => f.severity === s)) || "minimal";
+  const isMin = r.minified ? '<span class="tag">minified bundle</span>' : "";
+  const trunc = r.summary && r.summary.truncated
+    ? Object.entries(r.summary.truncated).map(([c, n]) => `${n} more ${c}`).join(", ")
+    : "";
+  const n = visible.length;
+  const shown = Math.min(n, (state.pagesShown[rid] || 1) * FINDINGS_PER_PAGE);
+  const items = visible.slice(0, shown).map(findingHTML).join("");
+  const more = n > shown
+    ? `<button class="show-more" data-rid="${esc(rid)}">Show ${n - shown} more findings…</button>` : "";
+  const truncNote = trunc ? `<div class="trunc-note">Capped at ${n} shown — ${esc(trunc)} not shown.</div>` : "";
+  const emptyNote = !n && !dismissedCount
+    ? `<div class="file-error" style="color:var(--muted)">No findings in this file. Clean scan.</div>` : "";
+  const dismissedNote = dismissedCount && !state.showDismissed
+    ? `<div class="trunc-note">${dismissedCount} dismissed finding${dismissedCount > 1 ? "s" : ""} hidden.</div>` : "";
+  const errNote = r.status === "failed"
+    ? `<div class="file-error">Failed: ${esc(r.error || "unknown error")}</div>` : "";
+
+  return `<div class="file-card" data-rid="${esc(rid)}">
+    <button class="file-head" type="button">
+      <span class="risk-badge risk-${maxSev}">${maxSev === "minimal" ? "clean" : maxSev}</span>
+      <span class="file-name">${esc(r.name)}</span>
+      ${isMin}
+      <span class="file-meta">${n} finding${n === 1 ? "" : "s"}</span>
+      <span class="chev">▾</span>
+    </button>
+    <div class="file-body">${errNote}${items}${emptyNote}${dismissedNote}${truncNote}${more}</div>
+  </div>`;
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+function findingHTML(f) {
+  const fid = esc(f.id);
+  const open = state.expanded.has(f.id);
+  const dismissed = state.dismissed.has(f.id);
+  const sev = esc(f.severity || "info");
+  const conf = esc(f.confidence || "");
+  const confCls = conf === "high" ? "conf-high" : conf === "low" ? "conf-low" : "";
+  const val = esc(f.value || "");
+  const detail = open ? `
+    <div class="f-detail">
+      ${f.context ? `<div class="f-context">${esc(f.context)}</div>` : ""}
+      ${f.snippet ? `<pre class="f-code">${esc(f.snippet)}</pre>` : ""}
+      ${f.note ? `<div class="f-note">${esc(f.note)}</div>` : ""}
+      <div class="f-actions">
+        <button class="btn ghost small-btn copy-btn" data-value="${esc(f.value || "")}" type="button">Copy value</button>
+        <button class="btn ghost small-btn dismiss-btn" data-fid="${fid}" type="button">${dismissed ? "Restore" : "Dismiss"}</button>
+      </div>
+    </div>` : "";
+  return `<div class="finding${dismissed ? " is-dismissed" : ""}" style="${dismissed && !state.showDismissed ? "display:none" : ""}">
+    <button class="finding-row" data-fid="${fid}" type="button">
+      <span class="sev-dot sev-${sev}"></span>
+      <span class="f-main">
+        <span class="f-title">${esc(f.title || f.type)} ${conf ? `<span class="conf ${confCls}">${conf}</span>` : ""}</span>
+        ${val ? `<span class="f-value">${val}</span>` : ""}
+      </span>
+      <span class="f-meta">L${f.line}${f.column ? ":" + f.column : ""}</span>
+    </button>
+    ${detail}
+  </div>`;
 }
 
-function capitalize(value) {
-  return value.charAt(0).toUpperCase() + value.slice(1);
+function toggleFinding(fid) {
+  const f = state.findingById[fid];
+  if (!f) return;
+  if (state.expanded.has(fid)) state.expanded.delete(fid);
+  else state.expanded.add(fid);
+  // surgical update: rebuild only this finding's node so scroll position
+  // and pagination state survive expand/collapse.
+  const row = document.querySelector(`.finding-row[data-fid="${CSS.escape(fid)}"]`);
+  if (!row) return;
+  const wrapper = row.closest(".finding");
+  const tmp = document.createElement("div");
+  tmp.innerHTML = findingHTML(f);
+  const fresh = tmp.firstElementChild;
+  wrapper.replaceWith(fresh);
+  wireFinding(fresh, fid);
 }
 
-function renderFindingContext(finding) {
-  if (!finding.context || finding.context === finding.value) return "";
-  return `<div class="finding-context">${escapeHtml(finding.context)}</div>`;
+function wireFinding(root, fid) {
+  const row = root.querySelector(".finding-row");
+  if (row) row.addEventListener("click", () => toggleFinding(fid));
+  const copy = root.querySelector(".copy-btn");
+  if (copy) copy.addEventListener("click", (e) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(copy.dataset.value).catch(() => {});
+    copy.textContent = "Copied ✓";
+    setTimeout(() => (copy.textContent = "Copy value"), 1200);
+  });
+  const dis = root.querySelector(".dismiss-btn");
+  if (dis) dis.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleDismiss(fid);
+  });
 }
 
-function trimSnippet(snippet) {
-  const lines = String(snippet).split("\n");
-  if (lines.length <= 18) return snippet;
-  return `${lines.slice(0, 18).join("\n")}\n...`;
+function toggleDismiss(fid) {
+  if (state.dismissed.has(fid)) state.dismissed.delete(fid);
+  else state.dismissed.add(fid);
+  state.renderToken = "";
+  maybeRenderResults();
 }
+
+/* ---------------- filters ---------------- */
+
+$("sev-filter").addEventListener("change", (e) => {
+  state.severity = e.target.value;
+  maybeRenderResults();
+});
+
+let searchTimer = null;
+$("search").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    state.search = e.target.value;
+    maybeRenderResults();
+  }, 150);
+});
+
+$("toggle-dismissed").addEventListener("click", () => {
+  state.showDismissed = !state.showDismissed;
+  maybeRenderResults();
+});
+$("restore-dismissed").addEventListener("click", () => {
+  state.dismissed = new Set();
+  state.showDismissed = false;
+  maybeRenderResults();
+});
+
+/* ---------------- export ---------------- */
+
+$("export-json").addEventListener("click", () => exportResults("json"));
+$("export-csv").addEventListener("click", () => exportResults("csv"));
+
+function exportResults(format) {
+  if (!state.jobId) return;
+  const a = document.createElement("a");
+  a.href = `/api/jobs/${encodeURIComponent(state.jobId)}/export?format=${format}`;
+  a.download = `peelr-${state.jobId}.${format}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/* ---------------- history ---------------- */
+
+$("history-btn").addEventListener("click", openHistory);
+$("history-close").addEventListener("click", closeHistory);
+$("history-overlay").addEventListener("click", (e) => {
+  if (e.target === $("history-overlay")) closeHistory();
+});
+
+async function openHistory() {
+  $("history-overlay").classList.remove("hidden");
+  const list = $("history-list");
+  list.innerHTML = '<p class="muted small">Loading…</p>';
+  try {
+    const res = await fetch("/api/history");
+    const records = await res.json();
+    if (!records.length) {
+      list.innerHTML = '<p class="muted small">No scans saved yet.</p>';
+      return;
+    }
+    list.innerHTML = records.map((rec) => {
+      const n = (rec.findings || []).length;
+      const top = ["critical", "high", "medium", "low", "info"].find((s) =>
+        (rec.findings || []).some((f) => f.severity === s));
+      return `
+      <div class="history-item" data-id="${esc(rec.id || rec.source_id)}">
+        <div class="h-name">${esc(rec.name)}</div>
+        <div class="h-meta">${esc(rec.scanned_at || "")} · ${n} finding${n === 1 ? "" : "s"}${top ? ` · top: ${top}` : ""}</div>
+      </div>`;
+    }).join("");
+    document.querySelectorAll(".history-item").forEach((el) =>
+      el.addEventListener("click", () => viewHistory(el.dataset.id, records))
+    );
+  } catch (err) {
+    list.innerHTML = '<p class="muted small">Could not load history.</p>';
+  }
+}
+
+function viewHistory(id, records) {
+  const rec = records.find((r) => (r.id || r.source_id) === id);
+  if (!rec) return;
+  stopPolling();
+  state.historyView = rec;
+  state.jobId = null;
+  state.job = null;
+  state.renderToken = "";
+  state.group = "all";
+  state.severity = "all";
+  state.search = "";
+  state.dismissed = new Set();
+  state.showDismissed = false;
+  state.expanded = new Set();
+
+  state.pagesShown = {};
+  $("sev-filter").value = "all";
+  $("search").value = "";
+  $("progress-card").classList.add("hidden");
+  $("results-section").classList.remove("hidden");
+  closeHistory();
+  maybeRenderResults();
+}
+
+function closeHistory() { $("history-overlay").classList.add("hidden"); }
