@@ -144,6 +144,9 @@ async function pollJob() {
 function updateProgress() {
   const job = state.job;
   const pct = job.total ? Math.round((job.completed / job.total) * 100) : 0;
+  $("progress-title").textContent =
+    job.status === "completed" ? "Scan complete" :
+    job.status === "failed" ? "Scan failed" : "Scan in progress";
   $("bar").style.width = pct + "%";
   const pill = $("job-status");
   pill.textContent = job.status;
