@@ -1,10 +1,32 @@
 # 🧅 Peelr
 
+[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen?style=flat)](#installation)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat)](#installation)
+
 **Peelr is a JavaScript URL analysis and triage tool for security research.**
 
 You give Peelr direct JavaScript URLs or local JavaScript files. It fetches or reads the source, analyzes the code, and highlights the findings worth reviewing first.
 
-Current release: `3.0.0`
+Current release: `3.0.1`
+
+## ⚡ Quickstart
+
+```bash
+git clone https://github.com/ibfavas/peelr.git
+cd peelr
+go build -o peelr ./cmd/peelr
+
+# Web UI → http://127.0.0.1:8080
+./peelr
+
+# CLI: scan a URL, a list of URLs, or local files
+./peelr --url https://target.com/app.js
+./peelr --file js_urls.txt
+./peelr --js-file ./dist
+cat js_urls.txt | ./peelr
+```
 
 ## 🆕 What's New in 3.0
 
@@ -15,11 +37,6 @@ Current release: `3.0.0`
 - **Performance** — minified bundles are scanned in chunks with quote-parity-safe literal extraction (a 3.3 MB single-line bundle analyzes in ~2.3 s), findings are capped per category (400) and overall (3000), and the UI paginates and virtualizes large result sets.
 - **CLI** — new `-min-severity` filter; severity-sorted table/plain output.
 - **Server** — `GET /api/jobs/{id}/export?format=csv|json`, accepts any `http(s)` URL (no more silent drops of URLs without `.js`), browser-like User-Agent on fetch, in-memory job store is bounded.
-
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen?style=flat)](#installation)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat)](#installation)
 
 ## Why Peelr
 
@@ -299,7 +316,7 @@ Run it with:
 ./peelr --js-file ./sample-test.js
 ```
 
-Example output (Peelr 3.0):
+Example output (Peelr 3.0.1):
 
 ```text
 sample-test.js
@@ -313,7 +330,7 @@ medium    high        parameters   Sensitive Query Parameter  10    email
 medium    high        parameters   Sensitive Query Parameter  10    token
 medium    medium      credentials  Hardcoded Secret           6     eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoidGVzdCJ9.signature
 medium    low         comments     Security Comment           2     // SECURITY: test fixture for Peelr CLI validation
-medium    low         credentials  Hardcoded Secret           5     AKIAIOSFODNN7EXAMPLE
+medium    low         credentials  Hardcoded Secret           5     <redacted>
 info      medium      endpoints    Endpoint Literal           10    /api/v1/profile?email=security@example.com&token=demo-token
 info      low         comments     TODO Comment               1     // TODO: remove before production
 ```
@@ -327,7 +344,7 @@ This sample demonstrates that Peelr can surface multiple categories in one pass:
 - endpoints
 - security-relevant comments
 
-Note what it does *not* report: the placeholder AWS key is downgraded, the example-domain email is skipped, and non-sensitive function parameters are ignored.
+Note the noise control in that output: the placeholder AWS key is downgraded to medium/low with its value redacted, the example-domain email is skipped, and non-sensitive function parameters are ignored.
 
 ## 🕘 History and Diffing
 
@@ -367,7 +384,6 @@ Example:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/jobs \
-  -F 'mode=js' \
   -F 'urls=https://target.com/app.js
 https://target.com/vendor.js'
 ```

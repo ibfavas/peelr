@@ -17,7 +17,7 @@ import (
 	"github.com/ibfavas/peelr/internal/server"
 )
 
-const version = "3.0.0"
+const version = "3.0.1"
 
 const banner = `
     ____            __
